@@ -1,0 +1,152 @@
+{
+  "summary": {
+    "description": "Wine Init Round 3 v3 closure: sortdefault.nls + 3 FEX Unix runtime libraries within 32MiB (33,554,432 bytes) budget",
+    "fits_under_30mb_budget": true,
+    "total_files": 21,
+    "total_bytes": 31184100,
+    "total_mb": 29.74,
+    "fits_under_32mib_budget": true
+  },
+  "target_pe": {
+    "path": "fixtures/runtime/pe-worker/pfx/drive_c/minimal-x64.exe",
+    "target": "drive_c/minimal-x64.exe",
+    "sha256": "87406032e5b7c6546afe5fa0f03847a5e398cb4981c969604417a828ab266bc8",
+    "bytes": 2048
+  },
+  "wineboot_exe": {
+    "path": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/wineboot.exe",
+    "target": "drive_c/windows/system32/wineboot.exe",
+    "sha256": "8c6dafd0a792b0f079e1ac6b59d9cd58cd3ed23a472ca981f75f4aeba02ceffe",
+    "bytes": 720896
+  },
+  "dlls": {
+    "advapi32.dll": {
+      "source": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/advapi32.dll",
+      "target": "drive_c/windows/system32/advapi32.dll",
+      "sha256": "415e8e001a9b0b4154f8d9e6f6f34f90c7c15918d6fd36d330331569bfd77291",
+      "bytes": 1179648
+    },
+    "kernel32.dll": {
+      "source": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/kernel32.dll",
+      "target": "drive_c/windows/system32/kernel32.dll",
+      "sha256": "4e891074e79667fdf0822c07fb16d316829dce0a40c554dfa9ddcbf29e23f3db",
+      "bytes": 1376256
+    },
+    "kernelbase.dll": {
+      "source": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/kernelbase.dll",
+      "target": "drive_c/windows/system32/kernelbase.dll",
+      "sha256": "e5783bef532a786af2f0b9d4ba0de0e02f198105fafb42bfaec4b4a0c106e399",
+      "bytes": 4390912
+    },
+    "msvcrt.dll": {
+      "source": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/msvcrt.dll",
+      "target": "drive_c/windows/system32/msvcrt.dll",
+      "sha256": "d2ac690e241b56751d9fccd1e533862aebdec97c466c04c404fc73aae19d5e61",
+      "bytes": 2097152
+    },
+    "ntdll.dll": {
+      "source": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/ntdll.dll",
+      "target": "drive_c/windows/system32/ntdll.dll",
+      "sha256": "1033f8724e012e31b38b8899ff03ba41c45e6e7e6b9b77fc549bf43baf43f1f4",
+      "bytes": 2293760
+    },
+    "sechost.dll": {
+      "source": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/sechost.dll",
+      "target": "drive_c/windows/system32/sechost.dll",
+      "sha256": "dbac96ec48c7c0bd2646777ef97fa9e998919c7b9f68a79f425eeab25539413c",
+      "bytes": 786432
+    },
+    "ucrtbase.dll": {
+      "source": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/ucrtbase.dll",
+      "target": "drive_c/windows/system32/ucrtbase.dll",
+      "sha256": "0331346ae15c7b3484067545216144b1532ae84d9be5df927492b5ad40a9ce94",
+      "bytes": 2490368
+    },
+    "ws2_32.dll": {
+      "source": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/ws2_32.dll",
+      "target": "drive_c/windows/system32/ws2_32.dll",
+      "sha256": "24162027d72896f938dbae34b67eb8f5721a4d9e2039ad025e11a204f4eb50af",
+      "bytes": 917504
+    },
+    "apisetschema.dll": {
+      "source": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/apisetschema.dll",
+      "target": "drive_c/windows/system32/apisetschema.dll",
+      "sha256": "bf7a4c252b22425624e3ae91ce57968dfd810ead4292bec2c061eaef55d99972",
+      "bytes": 196608
+    },
+    "libarm64ecfex.dll": {
+      "source": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/libarm64ecfex.dll",
+      "target": "drive_c/windows/system32/libarm64ecfex.dll",
+      "sha256": "ca9b1de29555f27f7c56a161d35b95a1077f233a877765fa7aef610ab6bb8e5e",
+      "bytes": 5365760
+    },
+    "cryptbase.dll": {
+      "source": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/cryptbase.dll",
+      "target": "drive_c/windows/system32/cryptbase.dll",
+      "sha256": "c9211606fe5d90ee3a59d0aa91c1c011ba5f8a69187e97750725081720075768",
+      "bytes": 589824,
+      "reason": "export_forwarder_dependency_of_advapi32"
+    },
+    "cryptsp.dll": {
+      "source": "fixtures/runtime/proton-derived/files/lib/wine/aarch64-windows/cryptsp.dll",
+      "target": "drive_c/windows/system32/cryptsp.dll",
+      "sha256": "ec511a9ce3c7995773947bcc307ec1f561ea8b108184c81c305d4c352fa20605",
+      "bytes": 589824,
+      "reason": "export_forwarder_dependency_of_advapi32"
+    }
+  },
+  "nls": {
+    "l_intl.nls": {
+      "source": "fixtures/runtime/proton-derived/files/share/wine/nls/l_intl.nls",
+      "target": "wine/share/wine/nls/l_intl.nls",
+      "sha256": "ad190cb85aa387d3d92a9d97ff254e20bf982a2ea9c11c2cad651ba0f8d20584",
+      "bytes": 5564
+    },
+    "c_20127.nls": {
+      "source": "fixtures/runtime/proton-derived/files/share/wine/nls/c_20127.nls",
+      "target": "wine/share/wine/nls/c_20127.nls",
+      "sha256": "951a19ce0d3c785d12ea94cb28ce5c2c096d302e35b3fb3e8b35248a006435ba",
+      "bytes": 66082
+    },
+    "locale.nls": {
+      "source": "fixtures/runtime/proton-derived/files/share/wine/nls/locale.nls",
+      "target": "wine/share/wine/nls/locale.nls",
+      "sha256": "868e5d3a3f115c2649706f566f9741aa3e2c6927c10b3f07d5e4c76b0e403115",
+      "bytes": 794914
+    },
+    "sortdefault.nls": {
+      "source": "fixtures/runtime/proton-derived/files/share/wine/nls/sortdefault.nls",
+      "target": "wine/share/wine/nls/sortdefault.nls",
+      "sha256": "2e58e6165d423c8764af40ebd30a9567e4ca710e230f93817e36df7bed3fd433",
+      "bytes": 3380468,
+      "reason": "kernelbase_sort_table_dependency"
+    }
+  },
+  "forwarders_resolved": {
+    "advapi32.dll": [
+      "cryptbase.dll (SystemFunction036/RtlGenRandom forwarder)",
+      "cryptsp.dll (CryptAcquireContext forwarder)"
+    ]
+  },
+  "unix_libs": {
+    "libstdc++.so.6": {
+      "source": "fixtures/runtime/arch-root/usr/lib/libstdc++.so.6.0.35",
+      "target": "usr/lib/libstdc++.so.6",
+      "target_soname": "usr/lib/libstdc++.so.6.0.35",
+      "sha256": "abdf011833740a6f0ca1654876f18d9a5911a9ad08806a38d015e60e3e516ab8",
+      "bytes": 3017768
+    },
+    "libm.so.6": {
+      "source": "fixtures/runtime/arch-root/usr/lib/libm.so.6",
+      "target": "usr/lib/libm.so.6",
+      "sha256": "71ed8de709c40acd4fd0177258fc71251a5acdb1d075122409ad42529d6c7a4e",
+      "bytes": 788960
+    },
+    "libgcc_s.so.1": {
+      "source": "fixtures/runtime/arch-root/usr/lib/libgcc_s.so.1",
+      "target": "usr/lib/libgcc_s.so.1",
+      "sha256": "ac598673a4bf67c0295b6609e46b1fafd0d4adf3f80a513d61ac49ecff772e48",
+      "bytes": 133352
+    }
+  }
+}

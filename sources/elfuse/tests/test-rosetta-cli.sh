@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+
+# test-rosetta-cli.sh - Exercise x86_64/Rosetta CLI gating paths
+#
+# Copyright 2026 elfuse contributors
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+ELFUSE="${1:-build/elfuse}"
+
+# Shared report_pass / report_fail / report_skip + test-runner.sh colors. The
+# matrix runner reads only the Results: line emitted by report_summary at the
+# bottom; per-binary lines now match the aarch64 modes' [ OK ] / [ FAIL ]
+# format.
+# shellcheck source=tests/lib/report.sh
+. "$(dirname "$0")/lib/report.sh"
+
+total=0
+
+tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/elfuse-rosetta-cli.XXXXXX")"
+trap 'rm -rf "$tmpdir"' EXIT
+
+x64_elf="$tmpdir/min-x86_64.elf"
+
+python3 - "$x64_elf" << 'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+ehdr = struct.pack(
+    "<16sHHIQQQIHHHHHH",
+    b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8),
+    2,          # ET_EXEC
+    62,         # EM_X86_64
+    1,          # EV_CURRENT
+    0x400000,   # e_entry
+    64,         # e_phoff
+    0,          # e_shoff
+    0,          # e_flags
+    64,         # e_ehsize
+    56,         # e_phentsize
+    1,          # e_phnum
+    0, 0, 0,
+)
+phdr = struct.pack(
+    "<IIQQQQQQ",
+    1,          # PT_LOAD
+    5,          # PF_R | PF_X
+    0,          # p_offset
+    0x400000,   # p_vaddr
+    0,          # p_paddr
+    0,          # p_filesz
+    0x1000,     # p_memsz
+    0x1000,     # p_align
+)
+with open(path, "wb") as f:
+    f.write(ehdr)
+    f.write(phdr)
+PY
+
+run_expect_fail()
+{
+    local label="$1"
+    local pattern="$2"
+    shift 2
+    total=$((total + 1))
+
+    local stderr="$tmpdir/${label}.stderr"
+    if "$@" > /dev/null 2> "$stderr"; then
+        report_fail "$label (command succeeded unexpectedly)"
+        cat "$stderr" >&2
+        report_summary "$total"
+        exit 1
+    fi
+    if ! grep -q -- "$pattern" "$stderr"; then
+        report_fail "$label (stderr did not contain $pattern)"
+        cat "$stderr" >&2
+        report_summary "$total"
+        exit 1
+    fi
+    report_pass "$label"
+}
+
+# Rosetta is on by default and architecture is auto-detected from the ELF
+# header; --no-rosetta opts out, and the rejection message points at the right
+# flag.
+run_expect_fail "rosetta-disabled-flag" \
+    "x86_64 ELF rejected by --no-rosetta" \
+    "$ELFUSE" --no-rosetta "$x64_elf"
+
+run_expect_fail "rosetta-disabled-env" \
+    "x86_64 ELF rejected by --no-rosetta" \
+    env ELFUSE_NO_ROSETTA=1 "$ELFUSE" "$x64_elf"
+
+run_expect_fail "rosetta-gdb" \
+    "--gdb is not supported for x86_64 guests" \
+    "$ELFUSE" --gdb 4010 "$x64_elf"
+
+# With Rosetta installed, elfuse bootstrap now reaches the translator and
+# rosettad bridge. Depending on host/runtime state, the remaining gaps can fail
+# in rosettad's translation cache path, in Rosetta's high-VA allocator, or with
+# the translator's own VZ-environment complaint. On hosts without Rosetta
+# installed the failure surfaces earlier with an install hint. Accept any of
+# those Rosetta-specific signatures to avoid masking unrelated elfuse failures.
+run_expect_fail "rosetta-default" \
+    "requires the Rosetta Linux translator\\|translate produced empty/missing output\\|Translation failed, invalid path or invalid executable\\|VMAllocationTracker\\|Rosetta is only intended to run on Apple Silicon" \
+    "$ELFUSE" "$x64_elf"
+
+report_summary "$total"

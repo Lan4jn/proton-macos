@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""
+tools/elfuse/bin/objcopy
+
+Specialized wrapper for elfuse build environment on macOS Apple Silicon.
+NOTE: This is NOT a full drop-in replacement for GNU objcopy.
+Scope:
+  1. For `objcopy -O binary <input.o> <output.bin>` where input is Mach-O 64-bit:
+     Extracts the `__text` section of segment `__TEXT` (or unnamed segment in relocatables).
+     Validates Mach-O 64-bit header (magic 0xfeedfacf / 0xcffaedfe), verifies section boundaries,
+     and writes exact raw binary payload matching otool/otool-classic __text dump.
+     If input is Mach-O but contains no __text or invalid offsets, fails explicitly with non-zero exit code.
+  2. For all other targets/formats (ELF, flags other than flat binary extraction):
+     Delegates directly to Homebrew LLVM llvm-objcopy.
+"""
+
+import sys
+import os
+import struct
+import subprocess
+
+def extract_macho_text(in_path, out_path):
+    with open(in_path, "rb") as f:
+        data = f.read()
+    if len(data) < 32:
+        return False, "Input file too small to be Mach-O"
+
+    magic = struct.unpack("<I", data[:4])[0]
+    # Check 64-bit Mach-O magic (little-endian: 0xfeedfacf, big-endian: 0xfeedfacf as 0xcffaedfe)
+    if magic != 0xfeedfacf and magic != 0xcffaedfe:
+        return False, f"Not a 64-bit Mach-O file (magic: 0x{magic:08x})"
+
+    header = struct.unpack("<IIIIIIII", data[:32])
+    ncmds = header[4]
+    off = 32
+    for cmd_idx in range(ncmds):
+        if off + 8 > len(data):
+            return False, f"Corrupted load command header at offset {off}"
+        cmd, cmdsize = struct.unpack("<II", data[off:off+8])
+        if cmd == 0x19: # LC_SEGMENT_64
+            if off + 72 > len(data):
+                return False, f"Truncated LC_SEGMENT_64 at offset {off}"
+            nsects = struct.unpack("<I", data[off+64:off+68])[0]
+            sec_off = off + 72
+            for s in range(nsects):
+                if sec_off + 80 > len(data):
+                    return False, f"Truncated section header in LC_SEGMENT_64"
+                sectname = data[sec_off:sec_off+16].rstrip(b"\x00").decode("latin1", errors="replace")
+                segname = data[sec_off+16:sec_off+32].rstrip(b"\x00").decode("latin1", errors="replace")
+                addr, size, file_offset = struct.unpack("<QQI", data[sec_off+32:sec_off+52])
+                if sectname == "__text":
+                    if file_offset + size > len(data):
+                        return False, f"Section __text bounds (off={file_offset}, size={size}) exceed file length ({len(data)})"
+                    with open(out_path, "wb") as out:
+                        out.write(data[file_offset:file_offset+size])
+                    return True, f"Successfully extracted __text section (offset={file_offset}, size={size})"
+                sec_off += 80
+        off += cmdsize
+
+    return False, "No __text section found in Mach-O LC_SEGMENT_64"
+
+def find_llvm_objcopy():
+    candidates = [
+        "/opt/homebrew/opt/llvm@22/bin/llvm-objcopy",
+        "/opt/homebrew/opt/llvm@21/bin/llvm-objcopy",
+        "/opt/homebrew/bin/llvm-objcopy",
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return "llvm-objcopy"
+
+def main():
+    args = sys.argv[1:]
+    is_binary_out = False
+    in_file = None
+    out_file = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "-O" and i + 1 < len(args):
+            if args[i+1] == "binary":
+                is_binary_out = True
+            i += 2
+            continue
+        elif arg == "--output-target=binary" or arg == "-Obinary":
+            is_binary_out = True
+            i += 1
+            continue
+        elif not arg.startswith("-"):
+            if in_file is None:
+                in_file = arg
+            elif out_file is None:
+                out_file = arg
+        i += 1
+
+    # Check if input is Mach-O
+    if is_binary_out and in_file and out_file and os.path.isfile(in_file):
+        with open(in_file, "rb") as f:
+            magic_bytes = f.read(4)
+        if len(magic_bytes) == 4:
+            magic = struct.unpack("<I", magic_bytes)[0]
+            if magic in (0xfeedfacf, 0xcffaedfe):
+                ok, msg = extract_macho_text(in_file, out_file)
+                if ok:
+                    sys.exit(0)
+                else:
+                    sys.stderr.write(f"[tools/elfuse/bin/objcopy error] Mach-O extraction failed: {msg}\n")
+                    sys.exit(1)
+
+    # Fallback to llvm-objcopy for ELF / other targets
+    llvm_objcopy = find_llvm_objcopy()
+    cmd = [llvm_objcopy] + args
+    res = subprocess.run(cmd)
+    sys.exit(res.returncode)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,48 @@
+=======================================================================
+Patch Apply & Byte-Identity Verification Log
+Target Patch: /Users/mewcapoo/Projects/proton-macos-lab/sources/patch-release/wine-vulkan-reentrancy-guard-adea6cbac.patch
+Target Source Tree: /Users/mewcapoo/Projects/proton-macos-lab/sources/wine-pin-adea/pristine/wine-adea6cbac9d00bb22910145354d00c463fcf3afc
+Target Commit: adea6cbac9d00bb22910145354d00c463fcf3afc
+Timestamp: 2026-10-27T00:59:11Z
+=======================================================================
+
+=== 1. patch -p1 --dry-run Test ===
+patching file 'dlls/win32u/d3dkmt.c'
+patching file 'dlls/win32u/vulkan.c'
+patching file 'dlls/win32u/win32u_private.h'
+patch -p1 --dry-run exit code: 0
+
+=== 2. git apply --check Test (in isolated git repository) ===
+git apply --check exit code: 0
+
+=== 3. Actual git apply & Stat ===
+ M dlls/win32u/d3dkmt.c
+ M dlls/win32u/vulkan.c
+ M dlls/win32u/win32u_private.h
+
+Modified lines summary:
+ dlls/win32u/d3dkmt.c         |  33 +++++++++++
+ dlls/win32u/vulkan.c         | 130 +++++++++++++++++++++++++++----------------
+ dlls/win32u/win32u_private.h |   4 ++
+ 3 files changed, 120 insertions(+), 47 deletions(-)
+
+=== 4. Byte-for-Byte SHA256 Comparison with Tested Patched Tree ===
+Target A: sources/wine-pin-adea/patched/ (tested runtime build)
+Target B: Freshly applied release patch on pristine adea6cbac
+
+File: dlls/win32u/d3dkmt.c
+  Tested Patched SHA: 2281833cd4b95353651044b059fece64a6716fc521befca32ed0e53c576917df
+  Applied Patch  SHA: 2281833cd4b95353651044b059fece64a6716fc521befca32ed0e53c576917df
+  Status: IDENTICAL (Match)
+
+File: dlls/win32u/vulkan.c
+  Tested Patched SHA: 8bdc516db04b6a542f8a7975148622812df9167c2ee522c0c4522360dd3e336e
+  Applied Patch  SHA: 8bdc516db04b6a542f8a7975148622812df9167c2ee522c0c4522360dd3e336e
+  Status: IDENTICAL (Match)
+
+File: dlls/win32u/win32u_private.h
+  Tested Patched SHA: 7f504dd51cb94bc5e1a4eea31e431df765fd9644e797ac464c16f3cb007ec368
+  Applied Patch  SHA: 7f504dd51cb94bc5e1a4eea31e431df765fd9644e797ac464c16f3cb007ec368
+  Status: IDENTICAL (Match)
+
+VERDICT: ALL VERIFICATIONS PASSED (Clean apply, zero errors, byte-identical to tested runtime)

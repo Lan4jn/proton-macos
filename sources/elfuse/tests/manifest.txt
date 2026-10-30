@@ -1,0 +1,192 @@
+# manifest.txt -- Declarative test list for elfuse test driver
+#
+# Copyright 2026 elfuse contributors
+# Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Format:
+#   [section] SECTION_NAME
+#   BINARY [ARGS...]           # optional: expected_rc=N, stdout=REGEX,
+#                              #           host_nofile=LIMIT
+# `host_nofile=elfuse-minimum` resolves from src/elfuse-limits.h and is applied
+# by both the data-driven driver and the elfuse matrix runner.
+#
+# BINARY is resolved relative to TESTDIR (default: build/).
+# Lines starting with # are comments. Blank lines are ignored.
+#
+# Scope: this file only lists tests that make check needs directly --
+# elfuse-internal implementation tests with no meaningful counterpart on a
+# real kernel (they can only ever be exercised against elfuse itself), plus
+# whatever mk/tests.mk's SANITIZER_SECTIONS regex selects for the
+# check-{asan,ubsan,tsan} lanes (those need a *sanitizer-instrumented elfuse
+# binary*, which only driver.sh -e can point at; qemu-aarch64 runs an
+# uninstrumented real kernel and cannot substitute for them). Every other
+# aarch64 test -- anything that is meaningful to cross-check against a real
+# Linux kernel -- lives exclusively in tests/test-matrix.sh's run_unit_tests,
+# which is a superset: it runs every one of these binaries too (via
+# elfuse-aarch64 mode), plus everything that used to be duplicated here.
+# Don't add a portable/cross-checkable test here; add it to test-matrix.sh
+# instead. Only add a test here if it is genuinely elfuse-internal, if a
+# SANITIZER_SECTIONS section needs it, or if it needs a host_nofile
+# annotation: that annotation has no other home, and test-matrix.sh reads it
+# from this file for its own elfuse lane, so a cross-checkable test that only
+# means anything under a specific host descriptor limit is listed here as well
+# as there. test-dir-fd-budget is the one such entry today.
+
+[section] Assembly tests
+test-hello
+
+[section] C tests (static)
+hello-musl
+hello-write
+echo-test hello world
+test-argc a b c
+test-complex                   # expected_rc=42
+test-fileio LICENSE
+test-string
+test-malloc
+test-cat tests/hello.S
+test-ls tests/
+test-roundtrip
+test-comprehensive
+
+[section] elfuse-internal implementation tests
+# These probe elfuse's own EL1 shim fast paths (identity cache, urandom
+# ring, shim_data privilege), the register state a ptrace-stop taken inside
+# that shim reports, and procfs sendfile/copy_file_range interception --
+# plumbing with no Linux-kernel counterpart, so they are never part of
+# test-matrix.sh (see each file's own header comment).
+test-oom-proc
+test-shim-identity
+test-shim-identity-attention
+test-shim-verbose-trace
+test-shim-data-el1
+test-shim-urandom-smp
+test-shim-urandom-toctou
+test-shim-urandom-wrap
+test-shim-futex-fast
+test-shim-futex-toctou
+test-ptrace-interrupt
+
+[section] I/O subsystem tests
+test-eventfd
+test-eventfd-dup
+test-eventfd-semaphore-contended
+test-signalfd
+test-signalfd-hardening
+test-epoll
+test-epoll-edge
+test-epoll-mt
+test-epoll-aba
+test-epoll-close
+test-epoll-dup
+test-epoll-refcount
+test-epoll-del-leak
+test-timerfd
+test-timerfd-overflow
+test-large-io-boundary
+test-ioctl-cloexec
+test-pty
+test-ioctl-fioasync
+test-getdents-refcount
+test-dir-fd-budget # host_nofile=elfuse-minimum
+test-dev-shm-paths
+test-fcntl-flags
+test-socket-shortwrite
+test-socket-blockwrite-signal
+test-socket-accept-contended
+test-socket-waitall
+test-synthetic-wait-signal
+test-sigpipe
+
+[section] Threading tests
+test-thread                    # diff=skip
+test-pthread
+test-thread-churn
+test-threaded-exec
+test-threaded-exec worker
+test-exec-handoff
+test-simd-clone                # diff=skip
+
+[section] Stress tests
+test-stress                    # diff=skip
+test-mprotect-mt               # diff=skip
+
+[section] Signal + thread tests
+test-signal-thread
+test-signal-in-shim           # diff=skip
+test-shim-sigreturn-x8
+test-sigsuspend
+test-fault-signal-mt           # diff=skip
+test-exit-group-worker
+
+[section] Fork edge cases
+test-clone3                    # diff=skip
+test-clone-childtid
+test-fork-exec $TESTDIR/echo-test
+test-fork-lowbase
+
+[section] CoW fork isolation tests
+test-cow-fork
+test-fork-synthetic-fd
+
+[section] Guard page / mmap edge cases
+test-guard-page
+test-mmap-hint
+test-mmap-sigbus-efault
+test-brk-stack
+
+[section] mremap tests
+test-mremap
+test-mremap-infra
+test-mremap-fork-tracking
+test-mremap-tail-emfile # host_nofile=elfuse-minimum
+test-shim-cred-race
+
+[section] msync MAP_SHARED tests
+test-msync
+
+[section] Read-only MAP_SHARED file overlay tests
+test-mmap-shared-ro
+
+[section] Cross-fork MAP_SHARED coherence tests
+test-cross-fork-mapshared          # diff=skip
+
+[section] madvise MADV_DONTNEED tests
+test-madvise
+
+[section] PI futex + EINTR regression tests
+test-futex-pi                  # diff=skip
+
+[section] futex_waitv (SYS 449) tests
+test-futex-waitv               # diff=skip
+
+[section] Timed futex wait ordering
+test-futex-timed
+
+[section] FUTEX_WAKE_OP operand decode
+test-futex-wake-op
+
+[section] FUTEX_WAKE with no waiter
+test-futex-wake-nowaiter
+
+[section] FUTEX_REQUEUE accounting
+test-futex-requeue-account
+
+[section] Robust futex tests
+test-robust-futex
+
+[section] FD table race tests
+test-fd-race
+test-dup-setfl-race
+test-pipe-steal
+test-fd-pin-lock
+
+[section] Multithreaded fork tests
+test-mt-fork
+
+[section] SysV shared memory tests
+test-sysv-shm
+
+[section] membarrier tests
+test-membarrier

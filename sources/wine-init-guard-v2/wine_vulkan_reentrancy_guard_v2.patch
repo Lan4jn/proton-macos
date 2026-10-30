@@ -1,0 +1,182 @@
+--- a/dlls/win32u/win32u_private.h	2026-10-24 01:05:06
++++ b/dlls/win32u/win32u_private.h	2026-10-24 01:18:54
+@@ -218,6 +218,10 @@
+ };
+ 
+ extern BOOL get_vulkan_gpus( struct list *gpus );
++extern BOOL is_vulkan_init_in_progress(void);
++extern BOOL vulkan_init_guard_enter(void);
++extern void vulkan_init_guard_exit(void);
++extern void vulkan_init_guard_cleanup(void *arg);
+ 
+ extern int d3dkmt_object_get_fd( D3DKMT_HANDLE local );
+ extern NTSTATUS d3dkmt_destroy_mutex( D3DKMT_HANDLE local );
+--- a/dlls/win32u/d3dkmt.c	2026-10-24 01:05:06
++++ b/dlls/win32u/d3dkmt.c	2026-10-24 01:18:55
+@@ -487,7 +487,43 @@
+ }
+ 
+ static struct vulkan_instance *d3dkmt_vulkan_instance; /* Vulkan instance for D3DKMT functions */
++
++static pthread_key_t d3dkmt_init_key;
++static pthread_once_t d3dkmt_key_once = PTHREAD_ONCE_INIT;
++static int d3dkmt_key_init_status = -1;
++
++static void init_d3dkmt_key(void)
++{
++    d3dkmt_key_init_status = pthread_key_create( &d3dkmt_init_key, NULL );
++}
++
++static BOOL is_d3dkmt_init_in_progress(void)
++{
++    pthread_once( &d3dkmt_key_once, init_d3dkmt_key );
++    if (d3dkmt_key_init_status != 0) return FALSE;
++    return pthread_getspecific( d3dkmt_init_key ) != NULL;
++}
+ 
++static BOOL d3dkmt_init_guard_enter(void)
++{
++    pthread_once( &d3dkmt_key_once, init_d3dkmt_key );
++    if (d3dkmt_key_init_status != 0) return FALSE;
++    if (pthread_setspecific( d3dkmt_init_key, (void *)(intptr_t)1 ) != 0) return FALSE;
++    return TRUE;
++}
++
++static void d3dkmt_init_guard_exit(void)
++{
++    if (d3dkmt_key_init_status == 0)
++        pthread_setspecific( d3dkmt_init_key, NULL );
++}
++
++static void d3dkmt_init_guard_cleanup(void *arg)
++{
++    d3dkmt_init_guard_exit();
++}
++
++
+ static void d3dkmt_init_vulkan(void)
+ {
+     static const struct vulkan_instance_extensions extensions =
+@@ -496,13 +532,21 @@
+         .has_VK_KHR_external_memory_capabilities = 1,
+     };
+ 
++    if (!d3dkmt_init_guard_enter())
++    {
++        WARN( "Failed to enter d3dkmt init guard\n" );
++        d3dkmt_vulkan_instance = NULL;
++        return;
++    }
+     d3dkmt_vulkan_instance = vulkan_instance_create( &extensions );
++    d3dkmt_init_guard_exit();
+     if (!d3dkmt_vulkan_instance) WARN( "Failed to create the vulkan instance\n" );
+ }
+ 
+ static struct vulkan_instance *get_d3dkmt_vulkan_instance(void)
+ {
+     static pthread_once_t once = PTHREAD_ONCE_INIT;
++    if (is_d3dkmt_init_in_progress()) return NULL;
+     pthread_once( &once, d3dkmt_init_vulkan );
+     return d3dkmt_vulkan_instance;
+ }
+@@ -1016,6 +1060,7 @@
+     struct vk_physdev_info *devinfo;
+     UINT i, j;
+ 
++    if (is_vulkan_init_in_progress()) return FALSE;
+     if (!(instance = get_d3dkmt_vulkan_instance())) return FALSE;
+     if (!(devinfo = calloc( instance->physical_device_count, sizeof(*devinfo) ))) return FALSE;
+ 
+--- a/dlls/win32u/vulkan.c	2026-10-24 01:05:06
++++ b/dlls/win32u/vulkan.c	2026-10-24 01:18:55
+@@ -35,7 +35,42 @@
+ #include "ntuser_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
++
++static pthread_key_t vulkan_init_key;
++static pthread_once_t vulkan_key_once = PTHREAD_ONCE_INIT;
++static int vulkan_key_init_status = -1;
++
++static void init_vulkan_key(void)
++{
++    vulkan_key_init_status = pthread_key_create( &vulkan_init_key, NULL );
++}
++
++BOOL is_vulkan_init_in_progress(void)
++{
++    pthread_once( &vulkan_key_once, init_vulkan_key );
++    if (vulkan_key_init_status != 0) return FALSE;
++    return pthread_getspecific( vulkan_init_key ) != NULL;
++}
++
++BOOL vulkan_init_guard_enter(void)
++{
++    pthread_once( &vulkan_key_once, init_vulkan_key );
++    if (vulkan_key_init_status != 0) return FALSE;
++    if (pthread_setspecific( vulkan_init_key, (void *)(intptr_t)1 ) != 0) return FALSE;
++    return TRUE;
++}
++
++void vulkan_init_guard_exit(void)
++{
++    if (vulkan_key_init_status == 0)
++        pthread_setspecific( vulkan_init_key, NULL );
++}
+ 
++void vulkan_init_guard_cleanup(void *arg)
++{
++    vulkan_init_guard_exit();
++}
++
+ static PFN_vkGetDeviceProcAddr p_vkGetDeviceProcAddr;
+ static PFN_vkGetInstanceProcAddr p_vkGetInstanceProcAddr;
+ static PFN_vkCreateInstance p_vkCreateInstance;
+@@ -4095,9 +4130,16 @@
+     struct vulkan_instance_extensions extensions = {0};
+     VkExtensionProperties *properties = NULL;
+     uint32_t count = 0;
+-    VkResult res;
++    VkResult res = VK_SUCCESS;
++    const char *env;
+ 
+-    const char *env = getenv( "WINE_DISABLE_FULLSCREEN_HACK" );
++    if (!vulkan_init_guard_enter())
++    {
++        ERR( "Failed to enter vulkan init guard\n" );
++        return;
++    }
++
++    env = getenv( "WINE_DISABLE_FULLSCREEN_HACK" );
+     fshack_enabled = !env || !atoi( env );
+ 
+ #ifdef SONAME_LIBVULKAN
+@@ -4106,7 +4148,11 @@
+ #else
+     ERR( "Wine was built without Vulkan support.\n" );
+ #endif
+-    if (!vulkan_handle) return;
++    if (!vulkan_handle)
++    {
++        vulkan_init_guard_exit();
++        return;
++    }
+ 
+ #define LOAD_FUNCPTR( f )                                                                          \
+     if (!(p_##f = dlsym( vulkan_handle, #f )))                                                     \
+@@ -4114,6 +4160,7 @@
+         ERR( "Failed to find " #f "\n" );                                                          \
+         dlclose( vulkan_handle );                                                                  \
+         vulkan_handle = NULL;                                                                      \
++        vulkan_init_guard_exit();                                                                  \
+         return;                                                                                    \
+     }
+ 
+@@ -4164,6 +4211,7 @@
+ #undef USE_VK_EXT
+ 
+ failed:
++    vulkan_init_guard_exit();
+     if (res) ERR( "Failed to initialize instance extensions, res %d\n", res );
+     free( properties );
+ }

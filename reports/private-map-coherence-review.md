@@ -1,0 +1,15 @@
+# Private-map coherence 独立审查
+- 能力匹配：本会话未呈现 skill 名录；MCP 检索无适配的源文件/unittest 工具，采用只读 CLI 与 Python unittest；未另派执行。
+- 实跑 `python3 -B -m unittest -v scripts.runtime.private_map_coherence.test_probe`（禁写 pycache）：7/7 PASS，exit 0；日志 `logs/private-map-coherence-review/tests.log`；仅测 classify，不执行 main/目标。
+- `linux.json` 是 elfuse 上 Linux 用户态而非 native Linux；stdout 一致、stderr 空：初值全0，SHARED_RW/RO 与 file=0x1234ABCD，PRIVATE_RO=0，fsync 后仍0；probe SHA256 与记录一致。
+- `darwin.json` 同样记录 stale；缺独立 Darwin stderr/退出状态与 native Linux 对照。probe.py:61 对 coherent/stale 均返回0，意为诊断完成而非 ABI 通过；POSIX 未保证 MAP_PRIVATE 可见后续文件修改。
+- `mem.c:3500–3552` 仅 SHARED+writable fd+host-page 对齐走 overlay，否则 pread 快照；`2312–2448` host overlay 为 RW SHARED|FIXED，含 quiesce、detach/remap 与 best-effort 恢复；解释候选成立，非完整路径验证。
+- Wine stderr 独立计数14条 mismatch（首次58行，715755.067/0068）；首条 err 为62行 class 注册失败，同线程同时间相邻；此前已有 syscall374 警告，故仅锁定首条显式 err 的局部关联。
+- `wine-session-id/result.json` exit=38，stdout 到 DPI_RETURNED=96；时序与14条警告不足锁定 firstfailure/退出的根因，更未证明 stale 导致 Wine 失败；实际 Wine object id/offset/映射字节未读取，禁止套用 ABI probe 的0。
+- Wine-11.0 winstation.c:176–190 是版本源码参考：比较 shared_session id、失败返回NULL；未证明对应已装包精确 commit/二进制，缺地址、预期/实际ID、生产者更新与消费者读取的关联证据。
+- private live overlay 仅设计：guest READ 阶段保留 live backing，WRITE 权限发布前先切匿名私有快照/COW；后续 guest 写与清理写均不得落原文件；host RW 不等于 guest 可写。
+- munmap/MAP_FIXED 必须先撤销文件别名再清零/复制或复用；部分范围、相邻映射与16KiB host页内4KiB guest子页须隔离；只读 fd 不得套现有 RW SHARED 路径或悄然放宽 fd 权限。
+- fork 与多线程要求 mmap锁+全 sibling quiesce，backing/region/HVF权限原子发布，fork 后独立COW；mmap/hv_vm_map/分段/分配任一步失败须恢复旧字节、权限、映射元数据并验证再恢复执行，现有 best-effort 不足作此保证。
+- 最小 RED→GREEN 矩阵（仅设计未实现）：①private-RO预触页后shared更新 stale→live；②WRITE升级后私写/再共享更新→文件不变且私页隔离；③munmap、匿名/异文件MAP_FIXED及部分替换→旧文件不变、邻页不损。
+- 矩阵续：④O_RDONLY fd+16KiB对齐/4KiB偏移/短尾→支持路径正确或显式限制且无越界；⑤fork+并发读/WRITE升级/替换→无共享私写与半发布；⑥逐阶段故障注入→完整回滚、旧映射可用、无残留别名；先 RED 再实现后 GREEN，不以当前7项分类测试代替。
+- 本次只新增测试日志及本报告，未改代码/fixture/原source/Wine/Proton，未启动新 Wine/HVF/其它目标，未 global/Steam/commit/push；报告路径 `reports/private-map-coherence-review.md`。

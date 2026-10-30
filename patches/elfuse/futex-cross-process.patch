@@ -1,0 +1,298 @@
+diff --git a/src/core/shim.S b/src/core/shim.S
+index 964a31d..e0a95a3 100644
+--- a/src/core/shim.S
++++ b/src/core/shim.S
+@@ -571,6 +571,8 @@ getsid_fast:
+  */
+ futex_wait_fast:
+     ldr w14, [sp, #8]                 /* op */
++    tst w14, #0x80                    /* FUTEX_PRIVATE_FLAG: shared futex must reach host */
++    b.eq futex_shape_bail
+     and w15, w14, #0x7f               /* FUTEX_CMD_MASK, pinned in futex.c */
+     cmp w15, #0                       /* FUTEX_WAIT */
+     b.eq futex_wait_shape
+diff --git a/src/runtime/futex.c b/src/runtime/futex.c
+index 6f93835..6241183 100644
+--- a/src/runtime/futex.c
++++ b/src/runtime/futex.c
+@@ -31,11 +31,14 @@
+ 
+ #include "utils.h"
+ 
++#include "core/guest.h"
+ #include "core/shim-globals.h"
++#include <os/os_sync_wait_on_address.h>
+ #include "runtime/futex.h"
+ #include "runtime/thread.h"
+ 
+ #include "syscall/linux-wire.h"
++#include "syscall/internal.h"
+ #include "syscall/proc.h"
+ #include "syscall/signal.h"
+ 
+@@ -71,6 +74,7 @@ static _Atomic int futex_interrupt_requested = 0;
+  * private vs shared futexes (single-process guest).
+  */
+ #define FUTEX_CMD_MASK 0x7F
++#define FUTEX_PRIVATE_FLAG 0x80
+ 
+ /* core/shim.S futex_wait_fast decodes the same three values as immediates,
+  * because assembly cannot see these defines. That leaves the shim serving a
+@@ -1865,6 +1869,154 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
+     return 0;
+ }
+ 
++/* Cross-process futex wait on MAP_SHARED memory when !(op & FUTEX_PRIVATE_FLAG) */
++static int64_t futex_wait_shared(guest_t *g,
++                                 uint64_t uaddr,
++                                 uint32_t expected,
++                                 uint64_t timeout_gva,
++                                 uint32_t bitset,
++                                 int is_absolute)
++{
++    if (bitset == 0)
++        return -LINUX_EINVAL;
++    if (bitset != FUTEX_BITSET_MATCH_ANY)
++        return -LINUX_ENOSYS;
++    if (!futex_uaddr_is_aligned(uaddr))
++        return -LINUX_EINVAL;
++
++    bool has_timeout = (timeout_gva != 0);
++    struct timespec deadline;
++    if (has_timeout) {
++        int rc = futex_make_deadline(g, timeout_gva, is_absolute, &deadline);
++        if (rc == -1)
++            return -LINUX_EFAULT;
++        if (rc == -2)
++            return -LINUX_EINVAL;
++    }
++
++    uint32_t *word = (uint32_t *) guest_ptr(g, uaddr);
++    if (!word)
++        return -LINUX_EFAULT;
++
++    /* Safe load under HOST_SIGBUS_GUARD */
++    uint32_t cur;
++    if (!futex_word_load(word, &cur))
++        return -LINUX_EFAULT;
++
++    /* Linux futex: if the current word does not match expected, return EAGAIN */
++    if (cur != expected)
++        return -LINUX_EAGAIN;
++
++    /* If timeout already expired, return ETIMEDOUT immediately */
++    if (has_timeout && futex_remaining_ns(&deadline, UINT64_MAX, NULL) == 0)
++        return -LINUX_ETIMEDOUT;
++
++    int ret = 0;
++    for (;;) {
++        if (!futex_word_load(word, &cur))
++            return -LINUX_EFAULT;
++        if (cur != expected) {
++            ret = 0;
++            break;
++        }
++
++        if (thread_stop_requested() || futex_interrupt_consume()) {
++            ret = -LINUX_EINTR;
++            break;
++        }
++
++        signal_check_timer_real();
++        if (signal_claim_interruption() || futex_kick_consume()) {
++            ret = -LINUX_EINTR;
++            break;
++        }
++
++        uint64_t slice_ns = 50000000ULL; /* 50ms slice */
++        if (has_timeout) {
++            uint64_t rem = futex_remaining_ns(&deadline, UINT64_MAX, NULL);
++            if (rem == 0) {
++                ret = -LINUX_ETIMEDOUT;
++                break;
++            }
++            if (slice_ns > rem)
++                slice_ns = rem;
++        }
++
++        int os_rc = os_sync_wait_on_address_with_timeout(
++            word, expected, 4,
++            OS_SYNC_WAIT_ON_ADDRESS_SHARED,
++            OS_CLOCK_MACH_ABSOLUTE_TIME,
++            slice_ns
++        );
++
++        if (os_rc >= 0) {
++            /* Successfully woken by waker (returns remaining waiter count >= 0) */
++            ret = 0;
++            break;
++        }
++
++        if (os_rc < 0) {
++            if (errno == ETIMEDOUT) {
++                if (has_timeout && futex_remaining_ns(&deadline, UINT64_MAX, NULL) == 0) {
++                    ret = -LINUX_ETIMEDOUT;
++                    break;
++                }
++                continue;
++            }
++            if (errno == EINTR) {
++                ret = -LINUX_EINTR;
++                break;
++            }
++            ret = linux_errno();
++            break;
++        }
++    }
++
++    return ret;
++}
++
++/* Cross-process futex wake on MAP_SHARED memory when !(op & FUTEX_PRIVATE_FLAG) */
++static int64_t futex_wake_shared(const guest_t *g,
++                                 uint64_t uaddr,
++                                 uint32_t val,
++                                 uint32_t bitset)
++{
++    if (bitset == 0)
++        return -LINUX_EINVAL;
++    if (bitset != FUTEX_BITSET_MATCH_ANY)
++        return -LINUX_ENOSYS;
++    if (!futex_uaddr_is_aligned(uaddr))
++        return -LINUX_EINVAL;
++
++    if (val == 0)
++        return 0;
++
++    uint32_t *word = (uint32_t *) guest_ptr(g, uaddr);
++    if (!word)
++        return -LINUX_EFAULT;
++
++    /* Verify word is readable under SIGBUS guard */
++    uint32_t probe;
++    if (!futex_word_load(word, &probe))
++        return -LINUX_EFAULT;
++
++    /* Wake waiters one by one up to val, stopping on ENOENT */
++    uint32_t woken = 0;
++    while (woken < val) {
++        int rc = os_sync_wake_by_address_any(word, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
++        if (rc == 0) {
++            woken++;
++        } else if (errno == ENOENT) {
++            /* No more waiters */
++            break;
++        } else {
++            return linux_errno();
++        }
++    }
++
++    return (int64_t) woken;
++}
++
+ /* Syscall entry point. */
+ 
+ int64_t sys_futex(guest_t *g,
+@@ -1876,50 +2028,69 @@ int64_t sys_futex(guest_t *g,
+                   uint32_t val3)
+ {
+     int cmd = op & FUTEX_CMD_MASK;
++    bool is_private = (op & FUTEX_PRIVATE_FLAG) != 0;
++    const guest_region_t *r = guest_region_find(g, uaddr);
++    bool is_shared_mapping = (r != NULL && r->shared);
++    bool is_cross_process = (!is_private && is_shared_mapping);
+ 
+     switch (cmd) {
+     case FUTEX_WAIT:
+-        /* On the bucket, like FUTEX_WAIT_BITSET. Darwin's
+-         * os_sync_wait_on_address would park it with no bucket lock, but the
+-         * only way to reach a thread parked there is to wake its address, which
+-         * it cannot tell from a FUTEX_WAKE. Ending the wait for a queued signal
+-         * that way reports EINTR for a wake that counted the waiter, or 0 for a
+-         * signal it could not claim. waiter.woken is what tells them apart.
+-         */
++        if (is_cross_process)
++            return futex_wait_shared(g, uaddr, val, timeout_gva,
++                                     FUTEX_BITSET_MATCH_ANY, /*is_absolute=*/0);
+         return futex_wait(g, uaddr, val, timeout_gva, FUTEX_BITSET_MATCH_ANY,
+                           /*is_absolute=*/0);
+ 
+     case FUTEX_WAKE:
++        if (is_cross_process)
++            return futex_wake_shared(g, uaddr, val, FUTEX_BITSET_MATCH_ANY);
+         return futex_wake(g, uaddr, val, FUTEX_BITSET_MATCH_ANY);
+ 
+     case FUTEX_REQUEUE:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         /* For REQUEUE, the timeout arg is repurposed as val2 (requeue count) */
+         return futex_requeue(g, uaddr, val, (uint32_t) timeout_gva, uaddr2,
+                              /*do_cmp=*/0, 0);
+ 
+     case FUTEX_CMP_REQUEUE:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         /* Same repurposing of timeout -> val2, plus compare against val3 */
+         return futex_requeue(g, uaddr, val, (uint32_t) timeout_gva, uaddr2,
+                              /*do_cmp=*/1, val3);
+ 
+     case FUTEX_WAKE_OP:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         /* timeout arg repurposed as val2 (wake count for uaddr2) */
+         return futex_wake_op(g, uaddr, val, uaddr2, (uint32_t) timeout_gva,
+                              val3);
+ 
+     case FUTEX_WAIT_BITSET:
++        if (is_cross_process)
++            return futex_wait_shared(g, uaddr, val, timeout_gva, val3,
++                                     /*is_absolute=*/1);
+         return futex_wait(g, uaddr, val, timeout_gva, val3, /*is_absolute=*/1);
+ 
+     case FUTEX_WAKE_BITSET:
++        if (is_cross_process)
++            return futex_wake_shared(g, uaddr, val, val3);
+         return futex_wake(g, uaddr, val, val3);
+ 
+     case FUTEX_LOCK_PI:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         return futex_lock_pi(g, uaddr, timeout_gva);
+ 
+     case FUTEX_UNLOCK_PI:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         return futex_unlock_pi(g, uaddr);
+ 
+     case FUTEX_TRYLOCK_PI:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         return futex_trylock_pi(g, uaddr);
+ 
+     default:
+@@ -1932,7 +2103,7 @@ int64_t sys_futex(guest_t *g,
+ 
+ int futex_wake_one(guest_t *g, uint64_t uaddr)
+ {
+-    return (int) futex_wake(g, uaddr, 1, FUTEX_BITSET_MATCH_ANY);
++    return (int) sys_futex(g, uaddr, FUTEX_WAKE, 1, 0, 0, FUTEX_BITSET_MATCH_ANY);
+ }
+ 
+ /* Unlink a waiter from whichever bucket it currently sits in, with retry on
+@@ -2115,6 +2286,16 @@ int64_t sys_futex_waitv(guest_t *g,
+          */
+         if (!futex_uaddr_is_aligned(elts[i].uaddr))
+             return -LINUX_EINVAL;
++
++        /* Cross-process shared mapping guard: Darwin ulock does not support
++         * multi-address waitv across processes. If any element targets a
++         * MAP_SHARED region without FUTEX2_PRIVATE, reject with -ENOSYS.
++         */
++        bool is_private = (elts[i].flags & FUTEX2_PRIVATE) != 0;
++        const guest_region_t *r = guest_region_find(g, elts[i].uaddr);
++        if (!is_private && r != NULL && r->shared) {
++            return -LINUX_ENOSYS;
++        }
+     }
+ 
+     waitv_shared_t shared;

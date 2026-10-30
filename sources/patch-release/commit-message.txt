@@ -1,0 +1,97 @@
+win32u: Defer Vulkan GPU enumeration during driver initialization to break recursive self-deadlock
+
+Problem:
+When running Windows ARM64 Vulkan applications (such as vk_enum_arm64.exe)
+under Valve Proton on Apple Silicon macOS via user-space virtualization
+(HVF/elfuse), calling vkCreateInstance() causes the process to hang silently
+until the watchdog kills it with a timeout (Exit Code 124).
+
+Root Cause:
+In dlls/win32u, initializing the Vulkan driver involves a cyclic dependency
+between graphics driver loading and display device enumeration on the same
+thread:
+1. vkCreateInstance() calls __wine_get_vulkan_driver(), which invokes
+   pthread_once(&init_once, vulkan_init_once). The once state transitions to
+   IN_PROGRESS (word = 1).
+2. vulkan_init_once() loads the user graphics driver, which calls
+   lock_display_devices() -> get_vulkan_gpus().
+3. get_vulkan_gpus() calls get_d3dkmt_vulkan_instance() ->
+   d3dkmt_init_vulkan() -> vulkan_instance_create().
+4. vulkan_instance_create() calls __wine_get_vulkan_driver(), which invokes
+   pthread_once(&init_once, vulkan_init_once) on the SAME thread.
+5. Because the once is already IN_PROGRESS by the calling thread, glibc/musl
+   pthread_once issues futex(uaddr=0x201039970, FUTEX_WAIT_PRIVATE, val=1).
+   Since the thread is waiting for itself to complete, it deadlocks permanently.
+
+Why Deferring GPU Enumeration vs NOP or Fake Completion:
+- Binary NOP: Simply patching the inner pthread_once instruction with NOP
+  bypasses the initial futex wait, but causes execution to fall through into
+  partially initialized driver function tables, triggering downstream secondary
+  re-entrancy deadlocks on secondary once variables (e.g. 0x20102d478) or
+  null pointer dereferences (e.g. ldr x1, [x8, #0x10]; br x1).
+- Fake Completion: Marking the once variable completed prematurely poisons
+  the once state, causing subsequent calls to assume initialization succeeded
+  before function pointers are populated. This leads to unbounded tail-call
+  spins (over 528,000 iterations observed in prior experiments) or crashes.
+- Deferred GPU Enumeration (this patch): Semantically breaks the circular edge
+  cleanly. When lock_display_devices() queries get_vulkan_gpus() while the
+  current thread is already executing vulkan_init_once(), get_vulkan_gpus()
+  immediately returns FALSE via is_vulkan_init_in_progress().
+  The display subsystem natively falls back to get_opengl_gpus() or default
+  virtual display adapters (lock_display_devices already handles FALSE
+  gracefully).
+  Crucially, d3dkmt_init_vulkan() is NOT invoked during this phase, meaning its
+  own once state remains unpoisoned (PTHREAD_ONCE_INIT). Once primary driver
+  initialization completes and the re-entrancy depth counter drops to zero,
+  subsequent D3DKMT calls can legitimately create the Vulkan instance and
+  enumerate physical GPUs.
+
+Thread-Local Storage Implementation Note:
+The reentrancy guard uses compiler thread-local storage
+(static __thread int vulkan_init_depth;) wrapped by pthread_cleanup_push/pop.
+This eliminates POSIX dynamic key table exhaustion risks (EAGAIN/ENOMEM) and
+key management complexity. In dynamically loaded shared libraries (dlopen),
+thread-local accesses may rely on dynamic thread vector (DTV) allocation
+via __tls_get_addr; thus, .tbss does not imply absolute zero-allocation
+under all dynamic linking edge cases, but it avoids manual pthread_key
+allocation points.
+
+Verification & Empirical Evidence:
+- Shipped Baseline Control (logs/wine-pin/shipped_baseline/run-73d055tk/):
+  * Executed with Valve shipped original win32u.so (SHA256: 4f6013fa...).
+  * Line 54: ONCE_ENTRY_COUNT ts_us=1573370812999 uaddr=0x201039970 word=0
+  * Line 71: ONCE_ENTRY_COUNT ts_us=1573379932582 uaddr=0x201039970 word=1
+  * Thread enters FUTEX_WAIT_PRIVATE on 0x201039970 waiting on itself.
+  * Hangs at Step 3 (vkCreateInstance) until timeout (Exit Code: 124).
+- Patched adea6cbac Build (logs/wine-pin/patched_adea/run-sjo653xi/):
+  * Executed with patched adea6cbac win32u.so (SHA256: 59a76b05...).
+  * Reentrancy guard actively suppresses recursive D3DKMT instance creation.
+  * Driver initializes smoothly, progresses through Step 1 to Step 5.
+  * Successfully queries physical devices: "Physical device count: 1".
+  * Enumerates device: "deviceName: llvmpipe (LLVM 23.1.1, 128 bits)".
+  * Clean exit (Exit Code: 0, Duration: 48.18s, FINAL_STATUS: WIN_ARM64_VULKAN_OK).
+- Binary & ABI Offset Verification:
+  * Pristine adea6cbac build (SHA256: 96de5f0a...) verified natural struct
+    alignment with shipped winevulkan.so (2786ca6f...):
+    - sizeof(struct vulkan_instance) == 0x2f8 (760 bytes)
+    - offsetof(physical_devices) == 0x2e0 (736 bytes)
+    - offsetof(physical_device_count) == 0x2e8 (744 bytes)
+    - sizeof(struct vulkan_physical_device) == 0x288 (648 bytes)
+    - sizeof(struct instance) == 0x368 (872 bytes)
+    - ALL_VK_INSTANCE_FUNCS count == 82
+  * Zero struct layout modifications; patch modifies only thread-local depth
+    counters and cleanup handlers.
+
+Scope & Caveats:
+- Target commit adea6cbac9d00bb22910145354d00c463fcf3afc represents an
+  empirically verified structural and runtime compatible baseline within the
+  equivalent commit range [66ee546cbea4..adea6cbac], but is not formally
+  certified as Valve's exact build submodule commit.
+- Verification was conducted in a runtime environment with
+  ELFUSE_DIAG_SESSION_SHARED=1 active (diagnostic shared alias mapping for
+  winstation sections, which diverges from true Linux private page cache COW
+  semantics). The guard fix resolves in-process reentrancy deadlock, while
+  cross-process COW semantics remain an orthogonal host concern.
+- This patch specifically addresses the recursive self-deadlock during driver
+  initialization; it does not claim upstream endorsement or to resolve all
+  Vulkan compatibility issues across arbitrary applications.

@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+
+# test-perf.sh -- Performance comparison: native vs elfuse for grep/wc/cat
+#
+# Copyright 2026 elfuse contributors
+# Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Measures wall-clock time for common coreutils operations, comparing macOS
+# native tools against the same tools running under elfuse. Overhead comes from
+# VM startup (~1-3ms) and per-syscall vmexits (~1-5us each). Pure computation
+# (regex matching etc.) runs at native speed.
+#
+# Timing uses the epoch_us helper from tests/lib/bash-compat.sh, which prefers
+# $EPOCHREALTIME (bash 5.0+) and falls back to 'date +%s %N' (macOS 14+/GNU
+# coreutils) or python3 / perl so the script works on stock macOS bash 3.2 too.
+#
+# Usage: tests/test-perf.sh <elfuse-binary> <tool-bin-dir>
+# Example: tests/test-perf.sh build/elfuse /path/to/tool/bin
+
+set -euo pipefail
+
+# pipefail in particular matters here: several benchmarks pipe an elfuse-hosted
+# producer (e.g. cat) into a native consumer (e.g. wc). Without pipefail, a
+# producer crash returns rc=0 from the pipeline, so the elfuse-side failure was
+# silently smoothed into a "fast" sample.
+
+# shellcheck source=tests/lib/bash-compat.sh
+. "$(dirname "$0")/lib/bash-compat.sh"
+
+ELFUSE="${1:?Usage: $0 <elfuse-binary> <tool-bin-dir>}"
+TOOL_BIN="${2:?Usage: $0 <elfuse-binary> <tool-bin-dir>}"
+SRCDIR="$(cd "$(dirname "$0")/.." && pwd)"
+SRC_SUBDIR="$SRCDIR/src"
+SYSCALL_C="$SRC_SUBDIR/syscall.c"
+
+# Colors
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+RESET='\033[0m'
+
+RUNS=10
+PATTERN="syscall"
+
+PERF_FAILED=0
+
+# Collect $RUNS timing samples for a command, print median and stats. Args:
+# label command...
+# Earlier revisions swallowed every sample's exit status with '|| true',
+# which made a missing native binary, an elfuse crash, or a host SIP block
+# silently degrade into "median 0 ms PASS". Now any non-zero sample aborts the
+# timing for that label and flips PERF_FAILED so the script exits non-zero after
+# running every other benchmark.
+benchmark()
+{
+    local label="$1"
+    shift
+    local times=()
+
+    for _ in $(seq 1 $RUNS); do
+        local start end us rc
+        start=$(epoch_us)
+        rc=0
+        "$@" > /dev/null 2>&1 || rc=$?
+        end=$(epoch_us)
+        if [ "$rc" -ne 0 ]; then
+            printf "  %-22s  ${YELLOW}FAIL${RESET} sample exited rc=%d\n" \
+                "$label" "$rc"
+            PERF_FAILED=1
+            return
+        fi
+        us=$((end - start))
+        # Store as fractional ms string (1 decimal place)
+        local ms_int=$((us / 1000))
+        local ms_frac=$(((us % 1000) / 100))
+        times+=("${ms_int}.${ms_frac}")
+    done
+
+    # Sort times numerically and pick median
+    local sorted
+    sorted=$(printf '%s\n' "${times[@]}" | sort -g)
+    local median min max
+    median=$(echo "$sorted" | sed -n "$((RUNS / 2 + 1))p")
+    min=$(echo "$sorted" | head -1)
+    max=$(echo "$sorted" | tail -1)
+
+    printf "  %-22s  median %7s ms  (min %s, max %s)\n" "$label" "$median" "$min" "$max"
+}
+
+printf "${BLUE}━━━ Performance: native vs elfuse (%d runs each) ━━━${RESET}\n\n" "$RUNS"
+
+for tool in grep wc cat sort; do
+    if [ ! -x "$TOOL_BIN/$tool" ]; then
+        printf "missing required guest tool: %s/%s\n" "$TOOL_BIN" "$tool" >&2
+        exit 1
+    fi
+done
+
+# Test 1: Recursive grep across elfuse source
+printf "${YELLOW}▸ grep -r '%s' (recursive, many file opens)${RESET}\n" "$PATTERN"
+benchmark "native /usr/bin/grep" /usr/bin/grep -r "$PATTERN" "$SRC_SUBDIR"
+benchmark "elfuse guest grep" "$ELFUSE" "$TOOL_BIN/grep" -r "$PATTERN" "$SRC_SUBDIR"
+echo
+
+# Test 2: Single-file grep (measures startup overhead)
+printf "${YELLOW}▸ grep -c 'case' syscall.c (single file, startup-dominated)${RESET}\n"
+benchmark "native /usr/bin/grep" /usr/bin/grep -c "case" "$SYSCALL_C"
+benchmark "elfuse guest grep" "$ELFUSE" "$TOOL_BIN/grep" -c "case" "$SYSCALL_C"
+echo
+
+# Test 3: wc -l on all source files
+printf "${YELLOW}▸ wc -l *.c *.h (many small files)${RESET}\n"
+benchmark "native /usr/bin/wc" sh -c "/usr/bin/wc -l '$SRC_SUBDIR'/*.c '$SRC_SUBDIR'/*.h"
+benchmark "elfuse guest wc" sh -c "'$ELFUSE' '$TOOL_BIN/wc' -l '$SRC_SUBDIR'/*.c '$SRC_SUBDIR'/*.h"
+echo
+
+# Test 4: I/O throughput, cat large file through wc
+printf "${YELLOW}▸ cat ~10MiB | wc -l (I/O throughput)${RESET}\n"
+TMPFILE=$(mktemp)
+trap 'rm -f "$TMPFILE"' EXIT
+# Build ~10MiB test file by repeating syscall.c (~100 times)
+for _ in $(seq 1 100); do cat "$SYSCALL_C" >> "$TMPFILE"; done
+TMPSIZE=$(wc -c < "$TMPFILE" | tr -d ' ')
+printf "  ${CYAN}(test file: %s bytes)${RESET}\n" "$TMPSIZE"
+
+# sh -c spawns a child shell that does not inherit the outer pipefail from the
+# script's 'set -o pipefail'. Run the pipeline under bash so pipefail is
+# available on systems whose /bin/sh is not bash-compatible.
+benchmark "native cat|wc" bash -c "set -o pipefail; cat '$TMPFILE' | wc -l"
+benchmark "elfuse cat|wc" bash -c "set -o pipefail; '$ELFUSE' '$TOOL_BIN/cat' '$TMPFILE' | wc -l"
+echo
+
+# Test 5: sort (CPU + I/O mix)
+printf "${YELLOW}▸ sort syscall.c (CPU-bound sorting + I/O)${RESET}\n"
+benchmark "native /usr/bin/sort" /usr/bin/sort "$SYSCALL_C"
+benchmark "elfuse guest sort" "$ELFUSE" "$TOOL_BIN/sort" "$SYSCALL_C"
+echo
+
+printf "${BLUE}━━━ Done ━━━${RESET}\n"
+printf "${CYAN}Overhead is dominated by: VM startup (~1-3ms), per-syscall vmexit (~1-5us),\n"
+printf "and macOS VFS translation. Pure computation runs at native speed.${RESET}\n"
+
+if [ "$PERF_FAILED" -ne 0 ]; then
+    printf "\n${YELLOW}One or more benchmark samples failed (see FAIL lines).${RESET}\n" >&2
+    exit 1
+fi

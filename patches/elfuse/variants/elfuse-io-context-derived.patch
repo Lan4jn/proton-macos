@@ -1,0 +1,1412 @@
+diff --git a/src/core/guest.c b/src/core/guest.c
+index 6d84f0f..552c6aa 100644
+--- a/src/core/guest.c
++++ b/src/core/guest.c
+@@ -44,6 +44,7 @@
+ #include "proved/align.h"
+ #include "proved/gva.h"
+ #include "core/startup-trace.h"
++#include "core/shim-globals.h"
+ #include "debug/log.h"
+ #include "utils.h"
+ #include "runtime/futex.h"  /* futex_interrupt_request */
+@@ -537,10 +538,14 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
+         if (size > 0 && try_size > size)
+             continue;
+ 
+-        /* Re-derive the layout for this slab size. */
++        /* Re-derive the layout for this slab size.
++         * Shift interp_base down by 12 GiB (0x300000000) and mmap_limit by 16 GiB (0x400000000)
++         * so Wine's top-of-memory 4 GiB reservation [0xfeffff0000, 0xffffff0000)
++         * does not collide with the 16 MiB infrastructure reserve or the dynamic linker load base.
++         */
+         g->guest_size = try_size;
+-        g->interp_base = try_size - 0x100000000ULL;
+-        g->mmap_limit = try_size - 0x200000000ULL;
++        g->interp_base = try_size - 0x300000000ULL;
++        g->mmap_limit = try_size - 0x400000000ULL;
+         g->overflow_ipa_next = try_size;
+         if (!compute_infra_layout(g))
+             continue;
+@@ -641,9 +646,9 @@ int guest_init_from_shm(guest_t *g,
+     g->guest_size = size;
+     g->ipa_bits = ipa_bits;
+ 
+-    /* Compute layout limits (same formula as guest_init) */
+-    g->interp_base = size - 0x100000000ULL;
+-    g->mmap_limit = size - 0x200000000ULL;
++    /* Compute layout limits (same formula as guest_init: interp at size-12GiB, mmap_limit at size-16GiB) */
++    g->interp_base = size - 0x300000000ULL;
++    g->mmap_limit = size - 0x400000000ULL;
+     g->overflow_ipa_next = size;
+     if (!compute_infra_layout(g)) {
+         /* Layout computation may reject a malformed header (impossible
+@@ -778,6 +783,18 @@ static void release_extra_mappings(guest_t *g)
+     g->n_mappings = 0;
+ }
+ 
++static bool g_guest_teardown_failed = false;
++
++bool guest_teardown_failed(void)
++{
++    return g_guest_teardown_failed;
++}
++
++void guest_teardown_clear_failure(void)
++{
++    g_guest_teardown_failed = false;
++}
++
+ void guest_destroy(guest_t *g)
+ {
+     /* Quiesce worker vCPUs before unmapping stage-2. thread_destroy_all_vcpus
+@@ -826,6 +843,7 @@ void guest_destroy(guest_t *g)
+          * reclaim them atomically, the one operation that safely stops a
+          * foreign vCPU. The leaked fds and heap are reclaimed the same way.
+          */
++        g_guest_teardown_failed = true;
+         log_warn(
+             "guest_destroy: worker vCPU still live past join cap; "
+             "deferring HVF teardown to process exit");
+@@ -843,6 +861,20 @@ void guest_destroy(guest_t *g)
+     g->vcpu_valid = false;
+     g->vcpu = 0;
+ 
++    /* Quiesce host preemption thread and join it BEFORE unmapping guest memory!
++     * If preemption thread stop fails, fail closed: defer memory unmap to process exit
++     * to prevent any potential use-after-free, and record failure!
++     */
++    if (proc_preempt_stop() < 0) {
++        g_guest_teardown_failed = true;
++        log_error(
++            "guest_destroy: failed to stop preemption thread; "
++            "deferring memory unmap to process exit to prevent UAF");
++        return;
++    }
++    signal_set_shim_globals_guest(NULL);
++    shim_globals_reset_singleton();
++
+     /* Unmap each HVF segment. hv_vm_destroy releases all stage-2 state
+      * regardless, but unmapping explicitly keeps invariants clean for
+      * downstream tools (Instruments, leak detectors).
+diff --git a/src/core/guest.h b/src/core/guest.h
+index 9054e5f..6a464f1 100644
+--- a/src/core/guest.h
++++ b/src/core/guest.h
+@@ -865,6 +865,10 @@ static inline bool guest_addr_in_infra(const guest_t *g, uint64_t addr)
+ 
+ /* API */
+ 
++/* Teardown failure status queries. */
++bool guest_teardown_failed(void);
++void guest_teardown_clear_failure(void);
++
+ /* Allocate guest memory, create VM, map to hypervisor. size: primary buffer
+  * size (0 = auto-detect from IPA capacity). ipa_bits: IPA width for HVF VM (0 =
+  * auto-detect).
+diff --git a/src/core/launch.c b/src/core/launch.c
+index 41fb93a..7049688 100644
+--- a/src/core/launch.c
++++ b/src/core/launch.c
+@@ -258,8 +258,13 @@ int elfuse_launch(const launch_args_t *args)
+      */
+     proc_pty_release_process_slaves();
+ 
+-    if (guest_initialized)
++    if (guest_initialized) {
+         guest_destroy(&g);
++        if (guest_teardown_failed() && exit_code == 0) {
++            log_error("elfuse: guest teardown failed; overriding exit code to 125");
++            exit_code = 125;
++        }
++    }
+ 
+     /* Rosetta guests keep the FUSE-materialized temp alive for the whole run
+      * (the translator reopens the host path); drop it now that the guest is
+diff --git a/src/core/shim.S b/src/core/shim.S
+index 964a31d..e0a95a3 100644
+--- a/src/core/shim.S
++++ b/src/core/shim.S
+@@ -571,6 +571,8 @@ getsid_fast:
+  */
+ futex_wait_fast:
+     ldr w14, [sp, #8]                 /* op */
++    tst w14, #0x80                    /* FUTEX_PRIVATE_FLAG: shared futex must reach host */
++    b.eq futex_shape_bail
+     and w15, w14, #0x7f               /* FUTEX_CMD_MASK, pinned in futex.c */
+     cmp w15, #0                       /* FUTEX_WAIT */
+     b.eq futex_wait_shape
+diff --git a/src/runtime/forkipc.c b/src/runtime/forkipc.c
+index c9eb8ec..2ceacd3 100644
+--- a/src/runtime/forkipc.c
++++ b/src/runtime/forkipc.c
+@@ -58,6 +58,7 @@
+ #include "hvutil.h"
+ #include "utils.h"
+ 
++#include "core/guest.h"
+ #include "core/shim-globals.h"
+ 
+ #include "runtime/forkipc.h"
+@@ -562,6 +563,10 @@ int fork_child_main(int ipc_fd,
+     proc_pty_release_process_slaves();
+ 
+     guest_destroy(&g);
++    if (guest_teardown_failed() && exit_code == 0) {
++        log_error("fork-child: guest teardown failed; overriding exit code to 125");
++        exit_code = 125;
++    }
+     return exit_code;
+ }
+ 
+diff --git a/src/runtime/futex.c b/src/runtime/futex.c
+index 6f93835..6241183 100644
+--- a/src/runtime/futex.c
++++ b/src/runtime/futex.c
+@@ -31,11 +31,14 @@
+ 
+ #include "utils.h"
+ 
++#include "core/guest.h"
+ #include "core/shim-globals.h"
++#include <os/os_sync_wait_on_address.h>
+ #include "runtime/futex.h"
+ #include "runtime/thread.h"
+ 
+ #include "syscall/linux-wire.h"
++#include "syscall/internal.h"
+ #include "syscall/proc.h"
+ #include "syscall/signal.h"
+ 
+@@ -71,6 +74,7 @@ static _Atomic int futex_interrupt_requested = 0;
+  * private vs shared futexes (single-process guest).
+  */
+ #define FUTEX_CMD_MASK 0x7F
++#define FUTEX_PRIVATE_FLAG 0x80
+ 
+ /* core/shim.S futex_wait_fast decodes the same three values as immediates,
+  * because assembly cannot see these defines. That leaves the shim serving a
+@@ -1865,6 +1869,154 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
+     return 0;
+ }
+ 
++/* Cross-process futex wait on MAP_SHARED memory when !(op & FUTEX_PRIVATE_FLAG) */
++static int64_t futex_wait_shared(guest_t *g,
++                                 uint64_t uaddr,
++                                 uint32_t expected,
++                                 uint64_t timeout_gva,
++                                 uint32_t bitset,
++                                 int is_absolute)
++{
++    if (bitset == 0)
++        return -LINUX_EINVAL;
++    if (bitset != FUTEX_BITSET_MATCH_ANY)
++        return -LINUX_ENOSYS;
++    if (!futex_uaddr_is_aligned(uaddr))
++        return -LINUX_EINVAL;
++
++    bool has_timeout = (timeout_gva != 0);
++    struct timespec deadline;
++    if (has_timeout) {
++        int rc = futex_make_deadline(g, timeout_gva, is_absolute, &deadline);
++        if (rc == -1)
++            return -LINUX_EFAULT;
++        if (rc == -2)
++            return -LINUX_EINVAL;
++    }
++
++    uint32_t *word = (uint32_t *) guest_ptr(g, uaddr);
++    if (!word)
++        return -LINUX_EFAULT;
++
++    /* Safe load under HOST_SIGBUS_GUARD */
++    uint32_t cur;
++    if (!futex_word_load(word, &cur))
++        return -LINUX_EFAULT;
++
++    /* Linux futex: if the current word does not match expected, return EAGAIN */
++    if (cur != expected)
++        return -LINUX_EAGAIN;
++
++    /* If timeout already expired, return ETIMEDOUT immediately */
++    if (has_timeout && futex_remaining_ns(&deadline, UINT64_MAX, NULL) == 0)
++        return -LINUX_ETIMEDOUT;
++
++    int ret = 0;
++    for (;;) {
++        if (!futex_word_load(word, &cur))
++            return -LINUX_EFAULT;
++        if (cur != expected) {
++            ret = 0;
++            break;
++        }
++
++        if (thread_stop_requested() || futex_interrupt_consume()) {
++            ret = -LINUX_EINTR;
++            break;
++        }
++
++        signal_check_timer_real();
++        if (signal_claim_interruption() || futex_kick_consume()) {
++            ret = -LINUX_EINTR;
++            break;
++        }
++
++        uint64_t slice_ns = 50000000ULL; /* 50ms slice */
++        if (has_timeout) {
++            uint64_t rem = futex_remaining_ns(&deadline, UINT64_MAX, NULL);
++            if (rem == 0) {
++                ret = -LINUX_ETIMEDOUT;
++                break;
++            }
++            if (slice_ns > rem)
++                slice_ns = rem;
++        }
++
++        int os_rc = os_sync_wait_on_address_with_timeout(
++            word, expected, 4,
++            OS_SYNC_WAIT_ON_ADDRESS_SHARED,
++            OS_CLOCK_MACH_ABSOLUTE_TIME,
++            slice_ns
++        );
++
++        if (os_rc >= 0) {
++            /* Successfully woken by waker (returns remaining waiter count >= 0) */
++            ret = 0;
++            break;
++        }
++
++        if (os_rc < 0) {
++            if (errno == ETIMEDOUT) {
++                if (has_timeout && futex_remaining_ns(&deadline, UINT64_MAX, NULL) == 0) {
++                    ret = -LINUX_ETIMEDOUT;
++                    break;
++                }
++                continue;
++            }
++            if (errno == EINTR) {
++                ret = -LINUX_EINTR;
++                break;
++            }
++            ret = linux_errno();
++            break;
++        }
++    }
++
++    return ret;
++}
++
++/* Cross-process futex wake on MAP_SHARED memory when !(op & FUTEX_PRIVATE_FLAG) */
++static int64_t futex_wake_shared(const guest_t *g,
++                                 uint64_t uaddr,
++                                 uint32_t val,
++                                 uint32_t bitset)
++{
++    if (bitset == 0)
++        return -LINUX_EINVAL;
++    if (bitset != FUTEX_BITSET_MATCH_ANY)
++        return -LINUX_ENOSYS;
++    if (!futex_uaddr_is_aligned(uaddr))
++        return -LINUX_EINVAL;
++
++    if (val == 0)
++        return 0;
++
++    uint32_t *word = (uint32_t *) guest_ptr(g, uaddr);
++    if (!word)
++        return -LINUX_EFAULT;
++
++    /* Verify word is readable under SIGBUS guard */
++    uint32_t probe;
++    if (!futex_word_load(word, &probe))
++        return -LINUX_EFAULT;
++
++    /* Wake waiters one by one up to val, stopping on ENOENT */
++    uint32_t woken = 0;
++    while (woken < val) {
++        int rc = os_sync_wake_by_address_any(word, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
++        if (rc == 0) {
++            woken++;
++        } else if (errno == ENOENT) {
++            /* No more waiters */
++            break;
++        } else {
++            return linux_errno();
++        }
++    }
++
++    return (int64_t) woken;
++}
++
+ /* Syscall entry point. */
+ 
+ int64_t sys_futex(guest_t *g,
+@@ -1876,50 +2028,69 @@ int64_t sys_futex(guest_t *g,
+                   uint32_t val3)
+ {
+     int cmd = op & FUTEX_CMD_MASK;
++    bool is_private = (op & FUTEX_PRIVATE_FLAG) != 0;
++    const guest_region_t *r = guest_region_find(g, uaddr);
++    bool is_shared_mapping = (r != NULL && r->shared);
++    bool is_cross_process = (!is_private && is_shared_mapping);
+ 
+     switch (cmd) {
+     case FUTEX_WAIT:
+-        /* On the bucket, like FUTEX_WAIT_BITSET. Darwin's
+-         * os_sync_wait_on_address would park it with no bucket lock, but the
+-         * only way to reach a thread parked there is to wake its address, which
+-         * it cannot tell from a FUTEX_WAKE. Ending the wait for a queued signal
+-         * that way reports EINTR for a wake that counted the waiter, or 0 for a
+-         * signal it could not claim. waiter.woken is what tells them apart.
+-         */
++        if (is_cross_process)
++            return futex_wait_shared(g, uaddr, val, timeout_gva,
++                                     FUTEX_BITSET_MATCH_ANY, /*is_absolute=*/0);
+         return futex_wait(g, uaddr, val, timeout_gva, FUTEX_BITSET_MATCH_ANY,
+                           /*is_absolute=*/0);
+ 
+     case FUTEX_WAKE:
++        if (is_cross_process)
++            return futex_wake_shared(g, uaddr, val, FUTEX_BITSET_MATCH_ANY);
+         return futex_wake(g, uaddr, val, FUTEX_BITSET_MATCH_ANY);
+ 
+     case FUTEX_REQUEUE:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         /* For REQUEUE, the timeout arg is repurposed as val2 (requeue count) */
+         return futex_requeue(g, uaddr, val, (uint32_t) timeout_gva, uaddr2,
+                              /*do_cmp=*/0, 0);
+ 
+     case FUTEX_CMP_REQUEUE:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         /* Same repurposing of timeout -> val2, plus compare against val3 */
+         return futex_requeue(g, uaddr, val, (uint32_t) timeout_gva, uaddr2,
+                              /*do_cmp=*/1, val3);
+ 
+     case FUTEX_WAKE_OP:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         /* timeout arg repurposed as val2 (wake count for uaddr2) */
+         return futex_wake_op(g, uaddr, val, uaddr2, (uint32_t) timeout_gva,
+                              val3);
+ 
+     case FUTEX_WAIT_BITSET:
++        if (is_cross_process)
++            return futex_wait_shared(g, uaddr, val, timeout_gva, val3,
++                                     /*is_absolute=*/1);
+         return futex_wait(g, uaddr, val, timeout_gva, val3, /*is_absolute=*/1);
+ 
+     case FUTEX_WAKE_BITSET:
++        if (is_cross_process)
++            return futex_wake_shared(g, uaddr, val, val3);
+         return futex_wake(g, uaddr, val, val3);
+ 
+     case FUTEX_LOCK_PI:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         return futex_lock_pi(g, uaddr, timeout_gva);
+ 
+     case FUTEX_UNLOCK_PI:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         return futex_unlock_pi(g, uaddr);
+ 
+     case FUTEX_TRYLOCK_PI:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         return futex_trylock_pi(g, uaddr);
+ 
+     default:
+@@ -1932,7 +2103,7 @@ int64_t sys_futex(guest_t *g,
+ 
+ int futex_wake_one(guest_t *g, uint64_t uaddr)
+ {
+-    return (int) futex_wake(g, uaddr, 1, FUTEX_BITSET_MATCH_ANY);
++    return (int) sys_futex(g, uaddr, FUTEX_WAKE, 1, 0, 0, FUTEX_BITSET_MATCH_ANY);
+ }
+ 
+ /* Unlink a waiter from whichever bucket it currently sits in, with retry on
+@@ -2115,6 +2286,16 @@ int64_t sys_futex_waitv(guest_t *g,
+          */
+         if (!futex_uaddr_is_aligned(elts[i].uaddr))
+             return -LINUX_EINVAL;
++
++        /* Cross-process shared mapping guard: Darwin ulock does not support
++         * multi-address waitv across processes. If any element targets a
++         * MAP_SHARED region without FUTEX2_PRIVATE, reject with -ENOSYS.
++         */
++        bool is_private = (elts[i].flags & FUTEX2_PRIVATE) != 0;
++        const guest_region_t *r = guest_region_find(g, elts[i].uaddr);
++        if (!is_private && r != NULL && r->shared) {
++            return -LINUX_ENOSYS;
++        }
+     }
+ 
+     waitv_shared_t shared;
+diff --git a/src/syscall/io.c b/src/syscall/io.c
+index 76fcbbb..b85c940 100644
+--- a/src/syscall/io.c
++++ b/src/syscall/io.c
+@@ -26,6 +26,7 @@
+ #include <sys/stat.h>
+ #include <sys/uio.h>
+ #include <sys/socket.h>
++#include <sys/un.h>
+ #include <sys/ioctl.h>
+ #include <poll.h>
+ #include <termios.h>
+@@ -57,6 +58,55 @@
+ #include "syscall/signal.h"
+ #include "syscall/wakeup-pipe.h"
+ 
++
++/* Diagnostic-only metadata, no data payloads or changed I/O outcomes. */
++static _Thread_local int io_observer_gfd = -1;
++static _Thread_local uint64_t io_observer_want;
++static void io_observe_wait(int host_fd, short events, int64_t elapsed)
++{
++    static unsigned emitted;
++    unsigned slot = __atomic_fetch_add(&emitted, 1, __ATOMIC_RELAXED);
++    if (slot >= 32) return;
++    int saved_errno = errno;
++    struct stat st = {0};
++    int flags = fcntl(host_fd, F_GETFL);
++    int stat_ok = fstat(host_fd, &st) == 0;
++    int peer = -1, peer_error = 0;
++#ifdef LOCAL_PEERPID
++    if (stat_ok && S_ISSOCK(st.st_mode)) {
++        socklen_t size = sizeof(peer);
++        if (getsockopt(host_fd, SOL_LOCAL, LOCAL_PEERPID, &peer, &size) < 0)
++            peer_error = errno;
++    }
++#endif
++    uint64_t tid = 0;
++    (void)pthread_threadid_np(NULL, &tid);
++    uint64_t elr = 0, lr = 0;
++    int elr_status = -1, lr_status = -1;
++    long long guest_tid = -1;
++    int syscall_nr = -1;
++    if (current_thread && current_thread->vcpu_valid) {
++        guest_tid = (long long)current_thread->guest_tid;
++        syscall_nr = current_thread->in_syscall;
++        elr_status = (int)hv_vcpu_get_sys_reg(current_thread->vcpu, HV_SYS_REG_ELR_EL1, &elr);
++        lr_status = (int)hv_vcpu_get_reg(current_thread->vcpu, HV_REG_LR, &lr);
++    }
++    char line[640];
++    int n = snprintf(line, sizeof(line),
++        "IO_WAIT_OBS_V2 pid=%ld tid=%llu slot=%u gfd=%d hfd=%d events=0x%x want=%llu elapsed_ms=%lld "
++        "stat_ok=%d mode=0x%x dev=%llu ino=%llu hostflags=0x%x peerpid=%d peer_error=%d "
++        "gtid=%lld syscall=%d elr=0x%llx lr=0x%llx elr_status=0x%x lr_status=0x%x\n",
++        (long)getpid(), (unsigned long long)tid, slot, io_observer_gfd,
++        host_fd, events, (unsigned long long)io_observer_want,
++        (long long)elapsed, stat_ok, (unsigned)(st.st_mode & S_IFMT),
++        (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
++        flags, peer, peer_error, guest_tid, syscall_nr,
++        (unsigned long long)elr, (unsigned long long)lr, elr_status, lr_status);
++    if (n > 0 && (size_t)n < sizeof(line))
++        (void)write(STDERR_FILENO, line, (size_t)n);
++    errno = saved_errno;
++}
++
+ #define URANDOM_CACHE_SIZE 4096
+ 
+ /* Linux terminal struct types. */
+@@ -269,6 +319,9 @@ int64_t io_wait_fd_timed_or_interrupted(int host_fd,
+                                         int timeout_ms)
+ {
+     int wake_fd = wakeup_pipe_read_fd();
++    bool observe = getenv("ELFUSE_IO_WAIT_OBSERVE") != NULL;
++    bool reported = false;
++    int64_t observe_start = observe ? io_now_ms() : 0;
+ 
+     /* An absolute deadline rather than a countdown: the 200 ms slices below
+      * exist to re-check interrupt conditions, and charging each one against a
+@@ -352,6 +405,10 @@ int64_t io_wait_fd_timed_or_interrupted(int host_fd,
+                 slice = (int) left;
+         }
+ 
++        if (observe && !reported && io_now_ms() - observe_start >= 2000) {
++            io_observe_wait(host_fd, events, io_now_ms() - observe_start);
++            reported = true;
++        }
+         int ret = poll(fds, 2, slice);
+         if (ret < 0)
+             return linux_errno();
+@@ -548,7 +605,11 @@ int64_t io_xfer(int fd,
+     unsigned backoff = 0, spins = 0;
+     for (;;) {
+         if (wait_first) {
++            io_observer_gfd = fd;
++            io_observer_want = want - (uint64_t)total;
+             int64_t waited = io_wait_fd_or_interrupted(host_fd, events);
++            io_observer_gfd = -1;
++            io_observer_want = 0;
+             if (waited < 0) {
+                 /* Interrupted, by a guest signal or by elfuse's own teardown
+                  * and execve-handoff wakes.
+diff --git a/src/syscall/mem.c b/src/syscall/mem.c
+index 43dda4f..57ee759 100644
+--- a/src/syscall/mem.c
++++ b/src/syscall/mem.c
+@@ -33,6 +33,41 @@
+ #include "syscall/internal.h"
+ #include "syscall/mem.h"
+ 
++
++/* Diagnostic-only fork: bounded observations, never a mapping result. */
++static void mmap_file_observe(int guest_fd, int host_fd, int prot, int flags,
++                              uint64_t addr, uint64_t length, uint64_t offset)
++{
++    static unsigned int emitted;
++    if (!getenv("ELFUSE_MMAP_FILE_OBSERVE") || (prot & LINUX_PROT_EXEC))
++        return;
++    int saved_errno = errno;
++    struct stat st;
++    int access = fcntl(host_fd, F_GETFL);
++    if (access >= 0 && fstat(host_fd, &st) == 0 && S_ISREG(st.st_mode) &&
++        (st.st_nlink == 0 || (flags & LINUX_MAP_SHARED))) {
++        unsigned int slot = __atomic_fetch_add(&emitted, 1, __ATOMIC_RELAXED);
++        if (slot < 64) {
++            char line[448];
++            int n = snprintf(line, sizeof(line),
++                "MMAP_FILE_OBS_V1 pid=%ld slot=%u dev=%llu ino=%llu links=%u "
++                "gfd=%d hfd=%d access=%d prot=0x%x flags=0x%x "
++                "addr=0x%llx len=0x%llx off=0x%llx phase=request\n",
++                (long)getpid(), slot, (unsigned long long)st.st_dev,
++                (unsigned long long)st.st_ino, (unsigned int)st.st_nlink,
++                guest_fd, host_fd, access & O_ACCMODE, prot, flags,
++                (unsigned long long)addr, (unsigned long long)length,
++                (unsigned long long)offset);
++            if (n > 0 && (size_t)n < sizeof(line))
++                (void)write(STDERR_FILENO, line, (size_t)n);
++        } else if (slot == 64) {
++            static const char capped[] = "MMAP_FILE_OBS_V1 capped=64 phase=request\n";
++            (void)write(STDERR_FILENO, capped, sizeof(capped)-1);
++        }
++    }
++    errno = saved_errno;
++}
++
+ /* Protects mmap/brk bump allocators and page table extension. Multiple threads
+  * may call mmap/brk concurrently; without this lock they could get overlapping
+  * allocations or corrupt page table structures.
+@@ -2870,6 +2905,31 @@ int64_t sys_mmap(guest_t *g,
+                  int fd,
+                  int64_t offset)
+ {
++    /* NOT AN ABI FIX: gated causal experiment sacrificing private-write isolation. */
++    if (getenv("ELFUSE_DIAG_SESSION_SHARED") && fd >= 0 &&
++        length == 0x144000 && offset == 0 && prot == (LINUX_PROT_READ | LINUX_PROT_WRITE) &&
++        (flags & LINUX_MAP_PRIVATE) && !(flags & LINUX_MAP_ANONYMOUS)) {
++        int saved_errno = errno;
++        host_fd_ref_t diagnostic_ref = HOST_FD_REF_INIT;
++        if (host_fd_ref_open(fd, &diagnostic_ref) >= 0) {
++            struct stat st;
++            int access = fcntl(diagnostic_ref.fd, F_GETFL);
++            if (access >= 0 && (access & O_ACCMODE) == O_RDWR &&
++                fstat(diagnostic_ref.fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 0) {
++                char line[256];
++                int n = snprintf(line, sizeof(line),
++                    "DIAGNOSTIC_SHARED_ALIAS_NOT_ABI_FIX pid=%ld dev=%llu ino=%llu len=0x144000 old_flags=0x%x\n",
++                    (long)getpid(), (unsigned long long)st.st_dev,
++                    (unsigned long long)st.st_ino, flags);
++                if (n > 0 && (size_t)n < sizeof(line))
++                    (void)write(STDERR_FILENO, line, (size_t)n);
++                flags = (flags & ~LINUX_MAP_PRIVATE) | LINUX_MAP_SHARED;
++            }
++            host_fd_ref_close(&diagnostic_ref);
++        }
++        errno = saved_errno;
++    }
++
+     bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
+     bool needs_exec = (prot & LINUX_PROT_EXEC) != 0;
+     bool is_prot_none = (prot == LINUX_PROT_NONE);
+@@ -2993,8 +3053,14 @@ int64_t sys_mmap(guest_t *g,
+          * runtime fields rather than compile-time low-memory constants.
+          */
+         uint64_t fix_end = off + length;
+-        if (guest_range_hits_infra(g, off, fix_end))
++        if (guest_range_hits_infra(g, off, fix_end)) {
++            uint64_t lo = 0, hi = 0;
++            guest_infra_window(g, &lo, &hi);
++            log_warn("mmap MAP_FIXED rejected by infra reserve: [0x%llx, 0x%llx) overlaps infra [0x%llx, 0x%llx)",
++                     (unsigned long long) off, (unsigned long long) fix_end,
++                     (unsigned long long) lo, (unsigned long long) hi);
+             return -LINUX_EINVAL;
++        }
+ 
+         result_off = off;
+ 
+@@ -3025,6 +3091,7 @@ int64_t sys_mmap(guest_t *g,
+                 return ref_err;
+             }
+             host_backing_fd = fresh.backing_ref.fd;
++            mmap_file_observe(fd, host_backing_fd, prot, flags, addr, length, offset);
+         }
+ 
+         remove_range_t replaced = {result_off, result_off + length};
+@@ -3252,6 +3319,7 @@ int64_t sys_mmap(guest_t *g,
+                 return ref_err;
+             }
+             host_backing_fd = fresh.backing_ref.fd;
++            mmap_file_observe(fd, host_backing_fd, prot, flags, addr, length, offset);
+         }
+ 
+         /* Prefer stage-2 2 MiB block boundaries for non-fixed MAP_SHARED
+diff --git a/src/syscall/net-absock.c b/src/syscall/net-absock.c
+index 80b6757..40202e8 100644
+--- a/src/syscall/net-absock.c
++++ b/src/syscall/net-absock.c
+@@ -82,13 +82,92 @@ static int absock_link_count;
+ 
+ static void absock_cleanup(void);
+ 
++/* Check whether a custom base directory specified via ELFUSE_ABSOCK_BASE is secure.
++ * Must be an absolute path, not a symlink (including when specified with a trailing slash),
++ * owned by getuid(), mode user-only (no group or other permissions).
++ * Returns 0 on success, or -1 with errno set:
++ *   EINVAL: not absolute, or empty string
++ *   ENOENT / ENOTDIR / EACCES: path lookup or permission violation
++ *   ELOOP: symlink detected
++ *   ENAMETOOLONG: total path would exceed sun_path budget
++ */
++static int absock_validate_custom_base(const char *base, char *clean_out, size_t clean_sz)
++{
++    if (!base || base[0] != '/') {
++        errno = EINVAL;
++        return -1;
++    }
++
++    size_t len = strlen(base);
++    if (len == 0 || len >= 60) {
++        errno = (len >= 60) ? ENAMETOOLONG : EINVAL;
++        return -1;
++    }
++
++    /* Strip any trailing slashes FIRST so lstat inspects the leaf link itself,
++     * not the link target (macOS lstat on a path with a trailing slash follows symlinks!).
++     */
++    size_t blen = len;
++    while (blen > 1 && base[blen - 1] == '/')
++        blen--;
++
++    if (blen >= clean_sz) {
++        errno = ENAMETOOLONG;
++        return -1;
++    }
++    memcpy(clean_out, base, blen);
++    clean_out[blen] = '\0';
++
++    struct stat st;
++    if (lstat(clean_out, &st) < 0)
++        return -1;
++
++    if (S_ISLNK(st.st_mode)) {
++        errno = ELOOP;
++        return -1;
++    }
++
++    if (!S_ISDIR(st.st_mode)) {
++        errno = ENOTDIR;
++        return -1;
++    }
++
++    if (st.st_uid != getuid() || (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
++        errno = EACCES;
++        return -1;
++    }
++
++    return 0;
++}
++
+ /* Spell the namespace directory for @namespace_id. Shared so a reader can name
+  * the directory without depending on this process being the one that created
+  * it, which is not the same thing: fork spawns a fresh process that inherits
+  * the id and reads back sockaddrs pointing into the shared dir.
++ *
++ * If ELFUSE_ABSOCK_BASE is set (including set-empty), validates it strictly.
++ * An invalid or set-empty base fails immediately with errno without fallback to /tmp.
++ * To preserve ample sun_path budget (< 104) for PID prefixes and FNV-1a digests,
++ * custom base uses the compact sub-directory format "/n%016llx" (18 bytes).
++ * Only an unset env defaults to /tmp with the legacy "/tmp/elfuse-absock-%llu".
+  */
+ static int absock_dir_format(char *out, size_t out_sz, uint64_t namespace_id)
+ {
++    const char *custom_base = getenv("ELFUSE_ABSOCK_BASE");
++    if (custom_base) {
++        char clean_base[64];
++        if (absock_validate_custom_base(custom_base, clean_base, sizeof(clean_base)) < 0)
++            return -1;
++
++        int n = snprintf(out, out_sz, "%s/n%016llx",
++                         clean_base, (unsigned long long) namespace_id);
++        if (n < 0 || (size_t) n >= out_sz || (size_t) n > 72) {
++            errno = ENAMETOOLONG;
++            return -1;
++        }
++        return n;
++    }
++
+     return snprintf(out, out_sz, "/tmp/elfuse-absock-%llu",
+                     (unsigned long long) namespace_id);
+ }
+@@ -111,7 +190,8 @@ static int absock_ensure_dir_locked(void)
+         return create_private_dir(absock_dir);
+     }
+ 
+-    absock_dir_format(absock_dir, sizeof(absock_dir), namespace_id);
++    if (absock_dir_format(absock_dir, sizeof(absock_dir), namespace_id) < 0)
++        return -1;
+ 
+     /* The namespace-id path is guessable; create_private_dir rejects a
+      * pre-planted symlink or foreign-owned directory in world-writable /tmp.
+diff --git a/src/syscall/net.c b/src/syscall/net.c
+index fd91d4c..ee44dfe 100644
+--- a/src/syscall/net.c
++++ b/src/syscall/net.c
+@@ -549,7 +549,7 @@ int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
+         }
+         if (absock_idx < 0) {
+             host_fd_ref_close(&host_ref);
+-            return -LINUX_EINVAL;
++            return linux_errno();
+         }
+         mac_len = bind_len;
+     } else {
+diff --git a/src/syscall/proc.c b/src/syscall/proc.c
+index c127a54..152dacd 100644
+--- a/src/syscall/proc.c
++++ b/src/syscall/proc.c
+@@ -3085,6 +3085,7 @@ static _Atomic uint64_t g_vcpu_progress;
+ 
+ static pthread_t g_preempt_thread;
+ static bool g_preempt_started;
++static _Atomic bool g_preempt_stop_requested;
+ 
+ static void drain_external_guest_signal(void);
+ 
+@@ -3104,9 +3105,13 @@ static void *preempt_thread_main(void *arg)
+     sigaddset(&wait_set, SIGALRM);
+ 
+     for (;;) {
++        if (atomic_load_explicit(&g_preempt_stop_requested, memory_order_acquire))
++            break;
+         int sig = 0;
+         if (sigwait(&wait_set, &sig) != 0)
+             continue;
++        if (atomic_load_explicit(&g_preempt_stop_requested, memory_order_acquire))
++            break;
+         if (sig == SIGUSR2) {
+             atomic_store_explicit(&g_external_guest_signal, 1,
+                                   memory_order_release);
+@@ -3217,6 +3222,12 @@ static void unlink_own_transport(void)
+     close(fd);
+ }
+ 
++static void proc_preempt_atfork_child(void)
++{
++    g_preempt_started = false;
++    atomic_store_explicit(&g_preempt_stop_requested, false, memory_order_relaxed);
++}
++
+ /* Call once from the main thread before any vCPU thread is created; the
+  * fork-child re-runs it in its own process. Not safe against concurrent callers
+  * (the g_preempt_started guard is a plain bool), which is fine because every
+@@ -3253,6 +3264,16 @@ int proc_preempt_init(void)
+         return -1;
+     }
+ 
++    static bool atfork_registered = false;
++    if (!atfork_registered) {
++        int aerr = pthread_atfork(NULL, NULL, proc_preempt_atfork_child);
++        if (aerr != 0) {
++            log_error("elfuse: pthread_atfork failed: %s", strerror(aerr));
++            return -1;
++        }
++        atfork_registered = true;
++    }
++
+     int err =
+         pthread_create(&g_preempt_thread, NULL, preempt_thread_main, NULL);
+     if (err != 0) {
+@@ -3266,7 +3287,42 @@ int proc_preempt_init(void)
+         return -1;
+     }
+     g_preempt_started = true;
+-    atexit(unlink_own_transport);
++    static bool atexit_registered = false;
++    if (!atexit_registered) {
++        atexit(unlink_own_transport);
++        atexit_registered = true;
++    }
++    return 0;
++}
++
++int proc_preempt_stop(void)
++{
++    if (!g_preempt_started)
++        return 0;
++
++    /* Prevent self-join deadlock */
++    if (pthread_equal(pthread_self(), g_preempt_thread)) {
++        log_error("elfuse: proc_preempt_stop called from preemption thread itself");
++        return -1;
++    }
++
++    atomic_store_explicit(&g_preempt_stop_requested, true, memory_order_release);
++    int kerr = pthread_kill(g_preempt_thread, SIGALRM);
++    if (kerr != 0 && kerr != ESRCH) {
++        log_error("elfuse: pthread_kill preemption thread failed: %s",
++                  strerror(kerr));
++        return -1;
++    }
++
++    int jerr = pthread_join(g_preempt_thread, NULL);
++    if (jerr != 0) {
++        log_error("elfuse: pthread_join preemption thread failed: %s",
++                  strerror(jerr));
++        return -1;
++    }
++
++    g_preempt_started = false;
++    atomic_store_explicit(&g_preempt_stop_requested, false, memory_order_relaxed);
+     return 0;
+ }
+ 
+diff --git a/src/syscall/proc.h b/src/syscall/proc.h
+index ad4303d..22bc802 100644
+--- a/src/syscall/proc.h
++++ b/src/syscall/proc.h
+@@ -577,6 +577,7 @@ int proc_send_guest_signal(pid_t host_pid,
+  * this process).
+  */
+ int proc_preempt_init(void);
++int proc_preempt_stop(void);
+ 
+ /* Syscall handlers. */
+ int64_t sys_pidfd_open(guest_t *g, int64_t pid, unsigned int flags);
+diff --git a/tests/run_verification.sh b/tests/run_verification.sh
+new file mode 100755
+index 0000000..4d0aa6d
+--- /dev/null
++++ b/tests/run_verification.sh
+@@ -0,0 +1,62 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
++DERIVED_ELFUSE="$REPO_ROOT/sources/elfuse-derived/build/elfuse"
++ORIG_ELFUSE="$REPO_ROOT/sources/elfuse/build/elfuse"
++SYSROOT="$REPO_ROOT/fixtures/runtime/sysroot"
++LOG="$REPO_ROOT/logs/abi-fix/verification_round3.log"
++
++mkdir -p "$(dirname "$LOG")"
++
++echo "=== ELFUSE ABI FIX VERIFICATION ROUND 3 ===" | tee "$LOG"
++date -u +"Date: %Y-%m-%d %H:%M:%S UTC" | tee -a "$LOG"
++echo "Derived binary: $DERIVED_ELFUSE" | tee -a "$LOG"
++
++# 1. Verify Red State on original binary
++echo "--- 1. Original Binary Red Reproduction ---" | tee -a "$LOG"
++"$ORIG_ELFUSE" --timeout 5 "$REPO_ROOT/fixtures/abi/bin/futex" > /tmp/orig_futex.out 2>&1 || true
++head -n 5 /tmp/orig_futex.out | tee -a "$LOG"
++if grep -q "FUTEX_TIMEOUT_DESPITE_SHARED_WRITE" /tmp/orig_futex.out; then
++    echo "Confirmed: Original binary fails with FUTEX_TIMEOUT_DESPITE_SHARED_WRITE" | tee -a "$LOG"
++fi
++rm -f /tmp/orig_futex.out
++
++# 2. Verify Green State on derived binary
++echo "--- 2. Derived Binary Green Verification (fixtures/abi/bin/futex) ---" | tee -a "$LOG"
++"$DERIVED_ELFUSE" --timeout 5 "$REPO_ROOT/fixtures/abi/bin/futex" 2>&1 | tee -a "$LOG"
++rc=$?
++echo "Exit Code: $rc" | tee -a "$LOG"
++
++# 3. Comprehensive Futex ABI Suite (12 edge cases & rigorous error mapping)
++echo "--- 3. Comprehensive Futex ABI Suite (test_futex_abi_suite) ---" | tee -a "$LOG"
++"$DERIVED_ELFUSE" --timeout 5 "$REPO_ROOT/sources/elfuse-derived/tests/test_futex_abi_suite" 2>&1 | tee -a "$LOG"
++rc=$?
++echo "Exit Code: $rc" | tee -a "$LOG"
++
++# 4. Shared memory fixture
++echo "--- 4. Shared memory fixture (fixtures/abi/bin/shared) ---" | tee -a "$LOG"
++"$DERIVED_ELFUSE" --timeout 5 "$REPO_ROOT/fixtures/abi/bin/shared" 2>&1 | tee -a "$LOG"
++echo "Exit Code: $?" | tee -a "$LOG"
++
++# 5. Signal fixture
++echo "--- 5. Signal fixture (fixtures/abi/bin/signal) ---" | tee -a "$LOG"
++"$DERIVED_ELFUSE" --timeout 5 "$REPO_ROOT/fixtures/abi/bin/signal" 2>&1 | tee -a "$LOG"
++echo "Exit Code: $?" | tee -a "$LOG"
++
++# 6. Dynamic glibc hello
++echo "--- 6. Dynamic glibc hello (fixtures/abi/bin/dynamic_hello) ---" | tee -a "$LOG"
++"$DERIVED_ELFUSE" --timeout 5 --sysroot "$SYSROOT" "$REPO_ROOT/fixtures/abi/bin/dynamic_hello" 2>&1 | tee -a "$LOG"
++echo "Exit Code: $?" | tee -a "$LOG"
++
++# 7. Priority 2 check: spawn_missing
++echo "--- 7. Priority 2 check: spawn_missing (architectural vfork limitation) ---" | tee -a "$LOG"
++"$DERIVED_ELFUSE" --timeout 5 --sysroot "$SYSROOT" "$REPO_ROOT/fixtures/abi/bin/spawn_missing" 2>&1 | tee -a "$LOG"
++echo "Exit Code: $?" | tee -a "$LOG"
++
++# 8. Baseline regression check (7 baseline tests)
++echo "--- 8. Baseline regression check (7 baseline tests) ---" | tee -a "$LOG"
++ELFUSE_BIN="$DERIVED_ELFUSE" "$REPO_ROOT/scripts/elfuse/run_all_baseline.sh" 2>&1 | tee -a "$LOG"
++echo "Baseline suite Exit Code: $?" | tee -a "$LOG"
++
++echo "=== ALL VERIFICATIONS COMPLETED ===" | tee -a "$LOG"
+diff --git a/tests/test-preempt-lifecycle-host.c b/tests/test-preempt-lifecycle-host.c
+new file mode 100644
+index 0000000..54075fe
+--- /dev/null
++++ b/tests/test-preempt-lifecycle-host.c
+@@ -0,0 +1,143 @@
++/*
++ * Unit test: proc_preempt_stop production lifecycle and happens-before join
++ *
++ * Copyright 2026 elfuse contributors
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Directly exercises the real production proc_preempt_init() and
++ * proc_preempt_stop() implementations in src/syscall/proc.c.
++ */
++
++#include <assert.h>
++#include <errno.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include "syscall/proc.h"
++#include "core/guest.h"
++
++static int fails;
++#define CHECK(cond)                                                          \
++    do {                                                                     \
++        if (!(cond)) {                                                       \
++            printf("  FAIL %s:%d: %s\n", __func__, __LINE__, #cond);         \
++            fails++;                                                         \
++        }                                                                    \
++    } while (0)
++
++/* Test 1: Real production start and clean stop */
++static void test_real_start_stop(void)
++{
++    printf("  [TEST 1] real production proc_preempt_init and proc_preempt_stop...\n");
++    int rc = proc_preempt_init();
++    CHECK(rc == 0);
++
++    /* Real production stop must return 0 */
++    int s = proc_preempt_stop();
++    CHECK(s == 0);
++}
++
++/* Test 2: Real production stop idempotency */
++static void test_real_stop_idempotent(void)
++{
++    printf("  [TEST 2] real production stop idempotency...\n");
++    /* Calling stop again on already stopped thread must return 0 without error */
++    int s1 = proc_preempt_stop();
++    CHECK(s1 == 0);
++    int s2 = proc_preempt_stop();
++    CHECK(s2 == 0);
++}
++
++/* Test 3: Multiple real production init-stop cycles */
++static void test_real_reinit_cycles(void)
++{
++    printf("  [TEST 3] 5 real production init-stop cycles...\n");
++    for (int i = 0; i < 5; i++) {
++        int rc = proc_preempt_init();
++        CHECK(rc == 0);
++        int s = proc_preempt_stop();
++        CHECK(s == 0);
++    }
++}
++
++/* Test 4: Signal delivered to process then stopped */
++static void test_real_signal_then_stop(void)
++{
++    printf("  [TEST 4] signal delivery to real preemption thread then stop...\n");
++    int rc = proc_preempt_init();
++    CHECK(rc == 0);
++
++    /* Send SIGALRM to self; the real preemption thread catches it via sigwait */
++    kill(getpid(), SIGALRM);
++    usleep(10000); /* 10ms for thread to process */
++
++    int s = proc_preempt_stop();
++    CHECK(s == 0);
++}
++
++/* Test 5: Fork child state reset through real pthread_atfork */
++static void test_real_fork_child_state(void)
++{
++    printf("  [TEST 5] fork child state reset with real pthread_atfork...\n");
++    int rc = proc_preempt_init();
++    CHECK(rc == 0);
++
++    pid_t pid = fork();
++    CHECK(pid >= 0);
++    if (pid == 0) {
++        /* In child: real pthread_atfork must have reset g_preempt_started to false */
++        /* Calling stop in child must be safe no-op returning 0 */
++        int s_child = proc_preempt_stop();
++        if (s_child != 0) {
++            _exit(1);
++        }
++        /* Re-init in child must start fresh thread */
++        int init_child = proc_preempt_init();
++        if (init_child != 0) {
++            _exit(2);
++        }
++        int s_child2 = proc_preempt_stop();
++        if (s_child2 != 0) {
++            _exit(3);
++        }
++        _exit(0);
++    }
++
++    int status = 0;
++    waitpid(pid, &status, 0);
++    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
++
++    int s = proc_preempt_stop();
++    CHECK(s == 0);
++}
++
++/* Test 6: Verify guest_teardown_failed flag behavior */
++static void test_teardown_failed_flag(void)
++{
++    printf("  [TEST 6] guest_teardown_failed flag and recovery...\n");
++    guest_teardown_clear_failure();
++    CHECK(!guest_teardown_failed());
++}
++
++int main(void)
++{
++    printf("test-preempt-lifecycle-host: testing REAL production proc_preempt functions\n");
++    test_real_start_stop();
++    test_real_stop_idempotent();
++    test_real_reinit_cycles();
++    test_real_signal_then_stop();
++    test_real_fork_child_state();
++    test_teardown_failed_flag();
++
++    if (fails == 0) {
++        printf("  ALL REAL PRODUCTION PREEMPT LIFECYCLE CHECKS PASSED\n");
++        return 0;
++    }
++    return 1;
++}
+diff --git a/tests/test_futex_abi_suite.c b/tests/test_futex_abi_suite.c
+new file mode 100644
+index 0000000..4e1c0f3
+--- /dev/null
++++ b/tests/test_futex_abi_suite.c
+@@ -0,0 +1,300 @@
++typedef unsigned int uint32_t;
++typedef unsigned long uint64_t;
++
++#define FUTEX_WAIT 0
++#define FUTEX_WAKE 1
++#define FUTEX_WAIT_BITSET 9
++#define FUTEX_WAKE_BITSET 10
++#define FUTEX_PRIVATE_FLAG 128
++#define FUTEX_WAIT_PRIVATE (FUTEX_WAIT | FUTEX_PRIVATE_FLAG)
++#define FUTEX_WAKE_PRIVATE (FUTEX_WAKE | FUTEX_PRIVATE_FLAG)
++
++#define WNOHANG 1
++
++static inline long sc(long n, long a, long b, long c, long d, long e, long f) {
++    register long x8 __asm__("x8") = n;
++    register long x0 __asm__("x0") = a;
++    register long x1 __asm__("x1") = b;
++    register long x2 __asm__("x2") = c;
++    register long x3 __asm__("x3") = d;
++    register long x4 __asm__("x4") = e;
++    register long x5 __asm__("x5") = f;
++    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5) : "memory");
++    return x0;
++}
++
++static inline void print_str(const char *s) {
++    long len = 0;
++    while (s[len]) len++;
++    sc(64, 1, (long)s, len, 0, 0, 0);
++}
++
++struct ts {
++    long tv_sec;
++    long tv_nsec;
++};
++
++void _start(void) {
++    print_str("--- FUTEX ABI TEST SUITE ---\n");
++
++    // Allocate shared page
++    volatile uint32_t *p = (void *)sc(222, 0, 16384, 3, 0x21, -1, 0); // mmap MAP_SHARED|MAP_ANONYMOUS
++    if ((long)p < 0 && (long)p > -4096) {
++        print_str("FAIL: mmap shared failed\n");
++        sc(93, 1, 0, 0, 0, 0, 0);
++    }
++    *p = 0;
++
++    // 1. Zero wake on zero waiters -> 0
++    long r1 = sc(98, (long)p, FUTEX_WAKE, 0, 0, 0, 0);
++    if (r1 != 0) {
++        print_str("FAIL: zero wake returned non-zero\n");
++        sc(93, 10, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 1 (zero wake -> 0)\n");
++
++    // 2. Wake with zero waiters -> 0
++    long r2 = sc(98, (long)p, FUTEX_WAKE, 1, 0, 0, 0);
++    if (r2 != 0) {
++        print_str("FAIL: wake 0 waiters returned non-zero\n");
++        sc(93, 11, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 2 (wake 0 waiters -> 0)\n");
++
++    // 3. Initial mismatch returns EAGAIN (-11)
++    *p = 42;
++    long r3 = sc(98, (long)p, FUTEX_WAIT, 999, 0, 0, 0); // expected 999, actual is 42
++    if (r3 != -11) {
++        print_str("FAIL: value mismatch did not return -EAGAIN\n");
++        sc(93, 12, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 3 (mismatch -> -EAGAIN)\n");
++
++    // 4. Timeout returns ETIMEDOUT (-110)
++    *p = 100;
++    struct ts short_to = {0, 30000000}; // 30ms
++    long r4 = sc(98, (long)p, FUTEX_WAIT, 100, (long)&short_to, 0, 0);
++    if (r4 != -110) {
++        print_str("FAIL: timeout did not return -ETIMEDOUT\n");
++        sc(93, 13, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 4 (timeout -> -ETIMEDOUT)\n");
++
++    // 5. Cross-process fork wait + wake
++    *p = 0;
++    long child = sc(220, 17, 0, 0, 0, 0, 0); // clone(SIGCHLD)
++    if (child < 0) {
++        print_str("FAIL: clone failed\n");
++        sc(93, 14, 0, 0, 0, 0, 0);
++    }
++    if (child == 0) {
++        // Child: delay 30ms, set *p = 1, call FUTEX_WAKE
++        struct ts d = {0, 30000000};
++        sc(101, (long)&d, 0, 0, 0, 0, 0); // nanosleep
++        *p = 1;
++        __asm__ volatile("dmb ish" ::: "memory");
++        long w = sc(98, (long)p, FUTEX_WAKE, 1, 0, 0, 0);
++        sc(93, w < 0 ? 99 : 0, 0, 0, 0, 0, 0); // exit(0)
++    }
++
++    // Parent waits with 1s limit
++    struct ts limit = {1, 0};
++    long w_res = sc(98, (long)p, FUTEX_WAIT, 0, (long)&limit, 0, 0);
++    int c_status = -1;
++    sc(260, child, (long)&c_status, 0, 0, 0, 0); // wait4
++
++    if (w_res != 0 && w_res != -11) {
++        print_str("FAIL: cross-process wait returned failure\n");
++        sc(93, 15, 0, 0, 0, 0, 0);
++    }
++    if (*p != 1) {
++        print_str("FAIL: *p was not 1 after wake\n");
++        sc(93, 16, 0, 0, 0, 0, 0);
++    }
++    if ((c_status >> 8) != 0) {
++        print_str("FAIL: child exited with error\n");
++        sc(93, 17, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 5 (cross-process fork wait+wake)\n");
++
++    // 6. Two waiters: wake 1 leaves exactly 1 blocked, second wake leaves 0
++    volatile uint32_t *p_two = (void *)sc(222, 0, 16384, 3, 0x21, -1, 0);
++    *p_two = 0;
++    long c1 = sc(220, 17, 0, 0, 0, 0, 0);
++    if (c1 == 0) {
++        // Child 1 waits on p_two
++        struct ts t = {2, 0};
++        sc(98, (long)p_two, FUTEX_WAIT, 0, (long)&t, 0, 0);
++        sc(93, 21, 0, 0, 0, 0, 0);
++    }
++    long c2 = sc(220, 17, 0, 0, 0, 0, 0);
++    if (c2 == 0) {
++        // Child 2 waits on p_two
++        struct ts t = {2, 0};
++        sc(98, (long)p_two, FUTEX_WAIT, 0, (long)&t, 0, 0);
++        sc(93, 22, 0, 0, 0, 0, 0);
++    }
++
++    // Give children time to park
++    struct ts park_d = {0, 50000000}; // 50ms
++    sc(101, (long)&park_d, 0, 0, 0, 0, 0);
++
++    // Wake 1 waiter
++    long woke_1 = sc(98, (long)p_two, FUTEX_WAKE, 1, 0, 0, 0);
++    if (woke_1 != 1) {
++        print_str("FAIL: wake 1 did not return 1\n");
++        sc(93, 18, 0, 0, 0, 0, 0);
++    }
++
++    // Wait 30ms to let the woken child exit
++    struct ts settle_d = {0, 30000000};
++    sc(101, (long)&settle_d, 0, 0, 0, 0, 0);
++
++    // Check with wait4(WNOHANG): exactly one child must have exited, the other still blocked
++    int st1 = -1, st2 = -1;
++    long r_c1 = sc(260, c1, (long)&st1, WNOHANG, 0, 0, 0);
++    long r_c2 = sc(260, c2, (long)&st2, WNOHANG, 0, 0, 0);
++
++    int dead_count = (r_c1 > 0 ? 1 : 0) + (r_c2 > 0 ? 1 : 0);
++    if (dead_count != 1) {
++        print_str("FAIL: wake 1 did not leave exactly 1 child running\n");
++        sc(93, 19, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 6a (wake 1 wakes exactly 1, leaves 1 blocked)\n");
++
++    // Now wake the remaining waiter
++    long woke_2 = sc(98, (long)p_two, FUTEX_WAKE, 1, 0, 0, 0);
++    if (woke_2 != 1) {
++        print_str("FAIL: wake remaining waiter did not return 1\n");
++        sc(93, 20, 0, 0, 0, 0, 0);
++    }
++
++    // Reap both
++    if (r_c1 == 0) sc(260, c1, (long)&st1, 0, 0, 0, 0);
++    if (r_c2 == 0) sc(260, c2, (long)&st2, 0, 0, 0, 0);
++    print_str("PASS: Case 6b (wake second waiter -> 1, both reaped)\n");
++
++    // 7. Real Waiter PRIVATE isolation test on shared mapping
++    volatile uint32_t *p_iso = (void *)sc(222, 0, 16384, 3, 0x21, -1, 0);
++    *p_iso = 0;
++    long c_iso = sc(220, 17, 0, 0, 0, 0, 0);
++    if (c_iso == 0) {
++        // Child waits with SHARED FUTEX_WAIT
++        struct ts t = {2, 0};
++        long wr = sc(98, (long)p_iso, FUTEX_WAIT, 0, (long)&t, 0, 0);
++        sc(93, wr == 0 ? 77 : 99, 0, 0, 0, 0, 0);
++    }
++
++    // Let child park
++    sc(101, (long)&park_d, 0, 0, 0, 0, 0);
++
++    // Parent calls FUTEX_WAKE_PRIVATE on shared mapping -> MUST return 0 (does NOT wake cross-process child)
++    long w_priv = sc(98, (long)p_iso, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
++    if (w_priv != 0) {
++        print_str("FAIL: FUTEX_WAKE_PRIVATE woke external waiter\n");
++        sc(93, 21, 0, 0, 0, 0, 0);
++    }
++    // Verify child is STILL BLOCKED
++    sc(101, (long)&settle_d, 0, 0, 0, 0, 0);
++    int iso_st = 0;
++    long iso_r = sc(260, c_iso, (long)&iso_st, WNOHANG, 0, 0, 0);
++    if (iso_r != 0) {
++        print_str("FAIL: child exited prematurely on PRIVATE wake\n");
++        sc(93, 22, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 7a (FUTEX_WAKE_PRIVATE returns 0, child still blocked)\n");
++
++    // Now parent calls shared FUTEX_WAKE -> child MUST wake and exit with 77
++    long w_shared = sc(98, (long)p_iso, FUTEX_WAKE, 1, 0, 0, 0);
++    if (w_shared != 1) {
++        print_str("FAIL: shared FUTEX_WAKE did not return 1\n");
++        sc(93, 23, 0, 0, 0, 0, 0);
++    }
++    sc(260, c_iso, (long)&iso_st, 0, 0, 0, 0);
++    if ((iso_st >> 8) != 77) {
++        print_str("FAIL: child did not exit with expected code 77\n");
++        sc(93, 24, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 7b (shared FUTEX_WAKE wakes child, reaped 77)\n");
++
++    // 8. Error mapping edge cases
++    // 8a: Misaligned address -> EINVAL (-22)
++    long err1 = sc(98, (long)p + 1, FUTEX_WAIT, 0, 0, 0, 0);
++    if (err1 != -22) {
++        print_str("FAIL: misaligned address did not return -EINVAL\n");
++        sc(93, 25, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 8a (misaligned -> -EINVAL)\n");
++
++    // 8b: Zero bitset -> EINVAL (-22)
++    long err2 = sc(98, (long)p, FUTEX_WAIT_BITSET, 0, 0, 0, 0); // bitset = 0
++    if (err2 != -22) {
++        print_str("FAIL: zero bitset did not return -EINVAL\n");
++        sc(93, 26, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 8b (zero bitset -> -EINVAL)\n");
++
++    // 8c: Unsupported non-any bitset on shared futex -> ENOSYS (-38)
++    long err3 = sc(98, (long)p, FUTEX_WAIT_BITSET, 0, 0, 0, 1); // bitset = 1
++    if (err3 != -38) {
++        print_str("FAIL: partial bitset on shared did not return -ENOSYS\n");
++        sc(93, 27, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 8c (partial bitset on shared -> -ENOSYS)\n");
++
++    // 8d: Unmapped invalid pointer -> EFAULT (-14)
++    long err4 = sc(98, 0x1234, FUTEX_WAIT, 0, 0, 0, 0);
++    if (err4 != -14) {
++        print_str("FAIL: unmapped pointer did not return -EFAULT\n");
++        sc(93, 28, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 8d (unmapped -> -EFAULT)\n");
++
++    // 8e: Wake error mappings
++    long err5 = sc(98, (long)p + 1, FUTEX_WAKE, 1, 0, 0, 0);
++    if (err5 != -22) {
++        print_str("FAIL: misaligned wake did not return -EINVAL\n");
++        sc(93, 29, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 8e (misaligned wake -> -EINVAL)\n");
++
++    // 8f: Wake on address with zero waiters returns 0 (Linux standard behavior)
++    long err6 = sc(98, 0x1234, FUTEX_WAKE, 1, 0, 0, 0);
++    if (err6 != 0) {
++        print_str("FAIL: unmapped wake with 0 waiters did not return 0\n");
++        sc(93, 30, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 8f (wake 0 waiters on unmapped addr -> 0)\n");
++
++    // 9. sys_futex_waitv on shared mapping -> ENOSYS (-38)
++    struct {
++        uint64_t val;
++        uint64_t uaddr;
++        uint32_t flags;
++        uint32_t __reserved;
++    } wv = { 0, (uint64_t)p, 2 /* FUTEX2_SIZE_U32, shared */, 0 };
++    long waitv_res = sc(449, (long)&wv, 1, 0, 0, 0, 0);
++    if (waitv_res != -38) {
++        print_str("FAIL: shared waitv did not return -ENOSYS\n");
++        sc(93, 31, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 9 (shared waitv -> -ENOSYS)\n");
++
++    // 10. sys_futex_waitv with FUTEX2_PRIVATE on stack/private memory -> non-ENOSYS (mismatch returns -EAGAIN)
++    uint32_t priv_word = 123;
++    struct {
++        uint64_t val;
++        uint64_t uaddr;
++        uint32_t flags;
++        uint32_t __reserved;
++    } wv_priv = { 999 /* mismatch */, (uint64_t)&priv_word, 2 | 0x80 /* FUTEX2_SIZE_U32 | FUTEX2_PRIVATE */, 0 };
++    long waitv_priv_res = sc(449, (long)&wv_priv, 1, 0, 0, 0, 0);
++    if (waitv_priv_res != -11) {
++        print_str("FAIL: private waitv mismatch did not return -EAGAIN\n");
++        sc(93, 32, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 10 (private waitv supported, mismatch -> -EAGAIN)\n");
++
++    print_str("ALL FUTEX ABI SUITE TESTS PASSED!\n");
++    sc(93, 0, 0, 0, 0, 0, 0);
++}

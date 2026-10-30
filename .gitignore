@@ -1,0 +1,111 @@
+# proton-macos-lab .gitignore for public publication
+# Tailored candidate ignore rules: clean, lightweight, privacy-checked
+
+# 1. Logs, raw execution receipts, traces and core dumps
+logs/
+reports/round*-v2/review/r/
+*.log
+*.out
+*.raw
+*.csv
+*.jsonl
+
+# 2. Large third-party runtimes, sysroots, bundles and compilation trees (>4GB)
+sysroots/
+artifacts/
+unix/
+sources/proton-v3-deploy/
+sources/wine-*-build/
+sources/wine-pin-*/
+sources/wine-ro-section-adapt/
+sources/wine-win32u-experimental/
+sources/s1-steam-offline-v2/client/
+sources/r1-cow-matrix-v2/
+
+# 3. Upstream Elfuse duplicate derived trees (reproducibility preserved via patches/elfuse/)
+sources/elfuse-*-derived/
+
+# 4. SteamCMD binary packages, local libraries and caches
+scripts/proton/tools/steamcmd/package/
+scripts/proton/tools/steamcmd/steamcmd
+fixtures/integration/steamcmd_home/
+fixtures/integration/tmp/
+
+# 5. P0 session ephemeral fixture and fake guest run directories
+sources/p0-session-round2/fixture-*/
+sources/p0-session-round2/guest-fake-*/
+sources/p0-session-round2/guest-fixture-*/
+
+# 6. Fixtures exclusions (large runtime sysroots/bundles; retain curated in-tree C/asm sources in fixtures/abi, etc.)
+fixtures/runtime/arch-*
+fixtures/runtime/arch-case.sparsebundle/
+fixtures/runtime/sysroot*
+fixtures/runtime/proton-derived/
+fixtures/runtime/pe-worker/pfx/
+fixtures/runtime/debian-root/
+fixtures/runtime/gcc-debian-root/
+fixtures/**/bin/
+fixtures/**/*.sparsebundle/
+
+# 7. Generic build objects, intermediate binaries, and executables
+**/build/
+**/target_*/
+**/bin-arm64/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.dmg
+*.zip
+*.tar*
+
+# 8. Ephemeral runtime prefixes, sessions and guest root mounts
+**/work/
+**/prefix/
+**/r/
+**/tmp/
+**/dosdevices/
+*.reg
+.update-timestamp
+descendant.pid
+*.pid
+
+# 9. Sensitive patterns & local runtime state (subject to pre-publish commit inventory check)
+.s/
+.sr/
+*.pem
+*.key
+*.token
+*.cookie*
+*credential*
+*.secret*
+**/steam_appid.txt
+
+# 10. OS and editor artifacts
+.DS_Store
+._*
+*.swp
+*.swo
+*~
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+
+# Publication inventory and local-only review material
+/sources/repository-publish/
+/scripts/proton/tools/steamcmd/
+/sources/s1-steam-offline-v2/
+/sources/elfuse/tests/fixtures/rosetta/x86_64-glibc-rootfs.tar.gz
+/sources/elfuse/tests/fixtures/rosetta/x86_64-rosetta-audit
+/sources/elfuse/tests/fixtures/rosetta/x86_64-rosetta-madvise
+/sources/elfuse/tests/fixtures/rosetta/x86_64-rosetta-mremap
+/sources/elfuse/tests/fixtures/rosetta/x86_64-rosetta-msync
+/sources/elfuse/tests/fixtures/rosetta/x86_64-rosetta-tls0
+*.so.*
+*.obj
+*.spv
+*.metallib

@@ -1,0 +1,6 @@
+"manifest"
+{
+  "commandline" "{PYTHON_EXE} {PROBE_PY_PATH} --log-dir {LOG_DIR_PATH} -- %verb%"
+  "version" "2"
+  "use_sessions" "1"
+}

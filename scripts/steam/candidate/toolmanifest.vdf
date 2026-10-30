@@ -1,0 +1,6 @@
+"manifest"
+{
+  "commandline" "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 /Users/mewcapoo/Projects/proton-macos-lab/scripts/steam/probe.py --log-dir /Users/mewcapoo/Projects/proton-macos-lab/logs/steam -- %verb%"
+  "version" "2"
+  "use_sessions" "1"
+}

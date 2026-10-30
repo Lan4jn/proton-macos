@@ -1,0 +1,2538 @@
+diff --git a/src/core/guest.c b/src/core/guest.c
+index 6d84f0f..552c6aa 100644
+--- a/src/core/guest.c
++++ b/src/core/guest.c
+@@ -44,6 +44,7 @@
+ #include "proved/align.h"
+ #include "proved/gva.h"
+ #include "core/startup-trace.h"
++#include "core/shim-globals.h"
+ #include "debug/log.h"
+ #include "utils.h"
+ #include "runtime/futex.h"  /* futex_interrupt_request */
+@@ -537,10 +538,14 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
+         if (size > 0 && try_size > size)
+             continue;
+ 
+-        /* Re-derive the layout for this slab size. */
++        /* Re-derive the layout for this slab size.
++         * Shift interp_base down by 12 GiB (0x300000000) and mmap_limit by 16 GiB (0x400000000)
++         * so Wine's top-of-memory 4 GiB reservation [0xfeffff0000, 0xffffff0000)
++         * does not collide with the 16 MiB infrastructure reserve or the dynamic linker load base.
++         */
+         g->guest_size = try_size;
+-        g->interp_base = try_size - 0x100000000ULL;
+-        g->mmap_limit = try_size - 0x200000000ULL;
++        g->interp_base = try_size - 0x300000000ULL;
++        g->mmap_limit = try_size - 0x400000000ULL;
+         g->overflow_ipa_next = try_size;
+         if (!compute_infra_layout(g))
+             continue;
+@@ -641,9 +646,9 @@ int guest_init_from_shm(guest_t *g,
+     g->guest_size = size;
+     g->ipa_bits = ipa_bits;
+ 
+-    /* Compute layout limits (same formula as guest_init) */
+-    g->interp_base = size - 0x100000000ULL;
+-    g->mmap_limit = size - 0x200000000ULL;
++    /* Compute layout limits (same formula as guest_init: interp at size-12GiB, mmap_limit at size-16GiB) */
++    g->interp_base = size - 0x300000000ULL;
++    g->mmap_limit = size - 0x400000000ULL;
+     g->overflow_ipa_next = size;
+     if (!compute_infra_layout(g)) {
+         /* Layout computation may reject a malformed header (impossible
+@@ -778,6 +783,18 @@ static void release_extra_mappings(guest_t *g)
+     g->n_mappings = 0;
+ }
+ 
++static bool g_guest_teardown_failed = false;
++
++bool guest_teardown_failed(void)
++{
++    return g_guest_teardown_failed;
++}
++
++void guest_teardown_clear_failure(void)
++{
++    g_guest_teardown_failed = false;
++}
++
+ void guest_destroy(guest_t *g)
+ {
+     /* Quiesce worker vCPUs before unmapping stage-2. thread_destroy_all_vcpus
+@@ -826,6 +843,7 @@ void guest_destroy(guest_t *g)
+          * reclaim them atomically, the one operation that safely stops a
+          * foreign vCPU. The leaked fds and heap are reclaimed the same way.
+          */
++        g_guest_teardown_failed = true;
+         log_warn(
+             "guest_destroy: worker vCPU still live past join cap; "
+             "deferring HVF teardown to process exit");
+@@ -843,6 +861,20 @@ void guest_destroy(guest_t *g)
+     g->vcpu_valid = false;
+     g->vcpu = 0;
+ 
++    /* Quiesce host preemption thread and join it BEFORE unmapping guest memory!
++     * If preemption thread stop fails, fail closed: defer memory unmap to process exit
++     * to prevent any potential use-after-free, and record failure!
++     */
++    if (proc_preempt_stop() < 0) {
++        g_guest_teardown_failed = true;
++        log_error(
++            "guest_destroy: failed to stop preemption thread; "
++            "deferring memory unmap to process exit to prevent UAF");
++        return;
++    }
++    signal_set_shim_globals_guest(NULL);
++    shim_globals_reset_singleton();
++
+     /* Unmap each HVF segment. hv_vm_destroy releases all stage-2 state
+      * regardless, but unmapping explicitly keeps invariants clean for
+      * downstream tools (Instruments, leak detectors).
+diff --git a/src/core/guest.h b/src/core/guest.h
+index 9054e5f..6a464f1 100644
+--- a/src/core/guest.h
++++ b/src/core/guest.h
+@@ -865,6 +865,10 @@ static inline bool guest_addr_in_infra(const guest_t *g, uint64_t addr)
+ 
+ /* API */
+ 
++/* Teardown failure status queries. */
++bool guest_teardown_failed(void);
++void guest_teardown_clear_failure(void);
++
+ /* Allocate guest memory, create VM, map to hypervisor. size: primary buffer
+  * size (0 = auto-detect from IPA capacity). ipa_bits: IPA width for HVF VM (0 =
+  * auto-detect).
+diff --git a/src/core/launch.c b/src/core/launch.c
+index 41fb93a..7049688 100644
+--- a/src/core/launch.c
++++ b/src/core/launch.c
+@@ -258,8 +258,13 @@ int elfuse_launch(const launch_args_t *args)
+      */
+     proc_pty_release_process_slaves();
+ 
+-    if (guest_initialized)
++    if (guest_initialized) {
+         guest_destroy(&g);
++        if (guest_teardown_failed() && exit_code == 0) {
++            log_error("elfuse: guest teardown failed; overriding exit code to 125");
++            exit_code = 125;
++        }
++    }
+ 
+     /* Rosetta guests keep the FUSE-materialized temp alive for the whole run
+      * (the translator reopens the host path); drop it now that the guest is
+diff --git a/src/core/shim.S b/src/core/shim.S
+index 964a31d..e0a95a3 100644
+--- a/src/core/shim.S
++++ b/src/core/shim.S
+@@ -571,6 +571,8 @@ getsid_fast:
+  */
+ futex_wait_fast:
+     ldr w14, [sp, #8]                 /* op */
++    tst w14, #0x80                    /* FUTEX_PRIVATE_FLAG: shared futex must reach host */
++    b.eq futex_shape_bail
+     and w15, w14, #0x7f               /* FUTEX_CMD_MASK, pinned in futex.c */
+     cmp w15, #0                       /* FUTEX_WAIT */
+     b.eq futex_wait_shape
+diff --git a/src/runtime/forkipc.c b/src/runtime/forkipc.c
+index c9eb8ec..2ceacd3 100644
+--- a/src/runtime/forkipc.c
++++ b/src/runtime/forkipc.c
+@@ -58,6 +58,7 @@
+ #include "hvutil.h"
+ #include "utils.h"
+ 
++#include "core/guest.h"
+ #include "core/shim-globals.h"
+ 
+ #include "runtime/forkipc.h"
+@@ -562,6 +563,10 @@ int fork_child_main(int ipc_fd,
+     proc_pty_release_process_slaves();
+ 
+     guest_destroy(&g);
++    if (guest_teardown_failed() && exit_code == 0) {
++        log_error("fork-child: guest teardown failed; overriding exit code to 125");
++        exit_code = 125;
++    }
+     return exit_code;
+ }
+ 
+diff --git a/src/runtime/futex.c b/src/runtime/futex.c
+index 6f93835..0f1a834 100644
+--- a/src/runtime/futex.c
++++ b/src/runtime/futex.c
+@@ -31,11 +31,14 @@
+ 
+ #include "utils.h"
+ 
++#include "core/guest.h"
+ #include "core/shim-globals.h"
++#include <os/os_sync_wait_on_address.h>
+ #include "runtime/futex.h"
+ #include "runtime/thread.h"
+ 
+ #include "syscall/linux-wire.h"
++#include "syscall/internal.h"
+ #include "syscall/proc.h"
+ #include "syscall/signal.h"
+ 
+@@ -71,6 +74,7 @@ static _Atomic int futex_interrupt_requested = 0;
+  * private vs shared futexes (single-process guest).
+  */
+ #define FUTEX_CMD_MASK 0x7F
++#define FUTEX_PRIVATE_FLAG 0x80
+ 
+ /* core/shim.S futex_wait_fast decodes the same three values as immediates,
+  * because assembly cannot see these defines. That leaves the shim serving a
+@@ -1865,8 +1869,188 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
+     return 0;
+ }
+ 
++/* Cross-process futex wait on MAP_SHARED memory when !(op & FUTEX_PRIVATE_FLAG) */
++static int64_t futex_wait_shared(guest_t *g,
++                                 uint64_t uaddr,
++                                 uint32_t expected,
++                                 uint64_t timeout_gva,
++                                 uint32_t bitset,
++                                 int is_absolute)
++{
++    if (bitset == 0)
++        return -LINUX_EINVAL;
++    if (bitset != FUTEX_BITSET_MATCH_ANY)
++        return -LINUX_ENOSYS;
++    if (!futex_uaddr_is_aligned(uaddr))
++        return -LINUX_EINVAL;
++
++    bool has_timeout = (timeout_gva != 0);
++    struct timespec deadline;
++    if (has_timeout) {
++        int rc = futex_make_deadline(g, timeout_gva, is_absolute, &deadline);
++        if (rc == -1)
++            return -LINUX_EFAULT;
++        if (rc == -2)
++            return -LINUX_EINVAL;
++    }
++
++    uint32_t *word = (uint32_t *) guest_ptr(g, uaddr);
++    if (!word)
++        return -LINUX_EFAULT;
++
++    /* Safe load under HOST_SIGBUS_GUARD */
++    uint32_t cur;
++    if (!futex_word_load(word, &cur))
++        return -LINUX_EFAULT;
++
++    /* Linux futex: if the current word does not match expected, return EAGAIN */
++    if (cur != expected)
++        return -LINUX_EAGAIN;
++
++    /* If timeout already expired, return ETIMEDOUT immediately */
++    if (has_timeout && futex_remaining_ns(&deadline, UINT64_MAX, NULL) == 0)
++        return -LINUX_ETIMEDOUT;
++
++    int ret = 0;
++    for (;;) {
++        if (!futex_word_load(word, &cur))
++            return -LINUX_EFAULT;
++        if (cur != expected) {
++            ret = 0;
++            break;
++        }
++
++        if (thread_stop_requested() || futex_interrupt_consume()) {
++            ret = -LINUX_EINTR;
++            break;
++        }
++
++        signal_check_timer_real();
++        if (signal_claim_interruption() || futex_kick_consume()) {
++            ret = -LINUX_EINTR;
++            break;
++        }
++
++        uint64_t slice_ns = 50000000ULL; /* 50ms slice */
++        if (has_timeout) {
++            uint64_t rem = futex_remaining_ns(&deadline, UINT64_MAX, NULL);
++            if (rem == 0) {
++                ret = -LINUX_ETIMEDOUT;
++                break;
++            }
++            if (slice_ns > rem)
++                slice_ns = rem;
++        }
++
++        int os_rc = os_sync_wait_on_address_with_timeout(
++            word, expected, 4,
++            OS_SYNC_WAIT_ON_ADDRESS_SHARED,
++            OS_CLOCK_MACH_ABSOLUTE_TIME,
++            slice_ns
++        );
++
++        if (os_rc >= 0) {
++            /* Successfully woken by waker (returns remaining waiter count >= 0) */
++            ret = 0;
++            break;
++        }
++
++        if (os_rc < 0) {
++            if (errno == ETIMEDOUT) {
++                if (has_timeout && futex_remaining_ns(&deadline, UINT64_MAX, NULL) == 0) {
++                    ret = -LINUX_ETIMEDOUT;
++                    break;
++                }
++                continue;
++            }
++            if (errno == EINTR) {
++                ret = -LINUX_EINTR;
++                break;
++            }
++            ret = linux_errno();
++            break;
++        }
++    }
++
++    return ret;
++}
++
++/* Cross-process futex wake on MAP_SHARED memory when !(op & FUTEX_PRIVATE_FLAG) */
++static int64_t futex_wake_shared(const guest_t *g,
++                                 uint64_t uaddr,
++                                 uint32_t val,
++                                 uint32_t bitset)
++{
++    if (bitset == 0)
++        return -LINUX_EINVAL;
++    if (bitset != FUTEX_BITSET_MATCH_ANY)
++        return -LINUX_ENOSYS;
++    if (!futex_uaddr_is_aligned(uaddr))
++        return -LINUX_EINVAL;
++
++    if (val == 0)
++        return 0;
++
++    uint32_t *word = (uint32_t *) guest_ptr(g, uaddr);
++    if (!word)
++        return -LINUX_EFAULT;
++
++    /* Verify word is readable under SIGBUS guard */
++    uint32_t probe;
++    if (!futex_word_load(word, &probe))
++        return -LINUX_EFAULT;
++
++    /* Wake waiters one by one up to val, stopping on ENOENT */
++    uint32_t woken = 0;
++    while (woken < val) {
++        int rc = os_sync_wake_by_address_any(word, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
++        if (rc == 0) {
++            woken++;
++        } else if (errno == ENOENT) {
++            /* No more waiters */
++            break;
++        } else {
++            return linux_errno();
++        }
++    }
++
++    return (int64_t) woken;
++}
++
+ /* Syscall entry point. */
+ 
++
++/* =========================================================================
++ * Thread Active Once Tracking & Generalized Reentrant Bypass (Task-97)
++ * ========================================================================= */
++#define MAX_ACTIVE_ONCES 32
++typedef struct {
++    uint64_t uaddrs[MAX_ACTIVE_ONCES];
++    int count;
++} active_once_set_t;
++
++static _Thread_local active_once_set_t g_active_onces = { .count = 0 };
++
++void once_track_enter(uint64_t uaddr, uint32_t word)
++{
++    if (word == 0) {
++        for (int i = 0; i < g_active_onces.count; i++) {
++            if (g_active_onces.uaddrs[i] == uaddr) return;
++        }
++        if (g_active_onces.count < MAX_ACTIVE_ONCES) {
++            g_active_onces.uaddrs[g_active_onces.count++] = uaddr;
++        }
++    }
++}
++
++bool once_is_active_for_thread(uint64_t uaddr)
++{
++    for (int i = 0; i < g_active_onces.count; i++) {
++        if (g_active_onces.uaddrs[i] == uaddr) return true;
++    }
++    return false;
++}
++
+ int64_t sys_futex(guest_t *g,
+                   uint64_t uaddr,
+                   int op,
+@@ -1876,50 +2060,101 @@ int64_t sys_futex(guest_t *g,
+                   uint32_t val3)
+ {
+     int cmd = op & FUTEX_CMD_MASK;
++    bool is_private = (op & FUTEX_PRIVATE_FLAG) != 0;
++    const guest_region_t *r = guest_region_find(g, uaddr);
++    bool is_shared_mapping = (r != NULL && r->shared);
++    bool is_cross_process = (!is_private && is_shared_mapping);
++
++
++    /* =========================================================================
++     * DIAGNOSTIC ONLY: Generalized Thread Reentrant Once Bypass (Task-97)
++     * ========================================================================= */
++    if (cmd == FUTEX_WAIT && is_private && val == 1 &&
++        getenv("ELFUSE_DIAG_REENTRY_RELEASE") != NULL) {
++        uint32_t cur_val = 0;
++        if (guest_read_small(g, uaddr, &cur_val, sizeof(cur_val)) == 0 && cur_val == 1) {
++            bool is_active = once_is_active_for_thread(uaddr);
++            bool force_release = (getenv("ELFUSE_DIAG_REENTRY_RELEASE_FORCE") != NULL);
++            if (is_active || force_release) {
++                static _Atomic int g_release_seq = 0;
++                int seq = atomic_fetch_add_explicit(&g_release_seq, 1, memory_order_relaxed) + 1;
++                uint32_t val2 = 2; // ONCE_COMPLETED
++                (void)guest_write_small(g, uaddr, &val2, sizeof(val2));
++
++                struct timespec ts;
++                clock_gettime(CLOCK_MONOTONIC, &ts);
++                uint64_t us = (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
++
++                char msg[512];
++                int n = snprintf(msg, sizeof(msg),
++                    "[DIAGNOSTIC] REENTRY_ONCE_BYPASS seq=%d uaddr=0x%llx old_val=1 new_val=2 tid=%lld pid=%ld ts_us=%llu is_active=%d%c",
++                    seq, (unsigned long long)uaddr,
++                    current_thread ? (long long)current_thread->guest_tid : 1LL,
++                    (long)getpid(), (unsigned long long)us, is_active ? 1 : 0, 10);
++                if (n > 0) (void)write(STDERR_FILENO, msg, (size_t)n);
++                return 0; // successfully bypassed wait
++            }
++        }
++    }
+ 
+     switch (cmd) {
+     case FUTEX_WAIT:
+-        /* On the bucket, like FUTEX_WAIT_BITSET. Darwin's
+-         * os_sync_wait_on_address would park it with no bucket lock, but the
+-         * only way to reach a thread parked there is to wake its address, which
+-         * it cannot tell from a FUTEX_WAKE. Ending the wait for a queued signal
+-         * that way reports EINTR for a wake that counted the waiter, or 0 for a
+-         * signal it could not claim. waiter.woken is what tells them apart.
+-         */
++        if (is_cross_process)
++            return futex_wait_shared(g, uaddr, val, timeout_gva,
++                                     FUTEX_BITSET_MATCH_ANY, /*is_absolute=*/0);
+         return futex_wait(g, uaddr, val, timeout_gva, FUTEX_BITSET_MATCH_ANY,
+                           /*is_absolute=*/0);
+ 
+     case FUTEX_WAKE:
++        if (is_cross_process)
++            return futex_wake_shared(g, uaddr, val, FUTEX_BITSET_MATCH_ANY);
+         return futex_wake(g, uaddr, val, FUTEX_BITSET_MATCH_ANY);
+ 
+     case FUTEX_REQUEUE:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         /* For REQUEUE, the timeout arg is repurposed as val2 (requeue count) */
+         return futex_requeue(g, uaddr, val, (uint32_t) timeout_gva, uaddr2,
+                              /*do_cmp=*/0, 0);
+ 
+     case FUTEX_CMP_REQUEUE:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         /* Same repurposing of timeout -> val2, plus compare against val3 */
+         return futex_requeue(g, uaddr, val, (uint32_t) timeout_gva, uaddr2,
+                              /*do_cmp=*/1, val3);
+ 
+     case FUTEX_WAKE_OP:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         /* timeout arg repurposed as val2 (wake count for uaddr2) */
+         return futex_wake_op(g, uaddr, val, uaddr2, (uint32_t) timeout_gva,
+                              val3);
+ 
+     case FUTEX_WAIT_BITSET:
++        if (is_cross_process)
++            return futex_wait_shared(g, uaddr, val, timeout_gva, val3,
++                                     /*is_absolute=*/1);
+         return futex_wait(g, uaddr, val, timeout_gva, val3, /*is_absolute=*/1);
+ 
+     case FUTEX_WAKE_BITSET:
++        if (is_cross_process)
++            return futex_wake_shared(g, uaddr, val, val3);
+         return futex_wake(g, uaddr, val, val3);
+ 
+     case FUTEX_LOCK_PI:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         return futex_lock_pi(g, uaddr, timeout_gva);
+ 
+     case FUTEX_UNLOCK_PI:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         return futex_unlock_pi(g, uaddr);
+ 
+     case FUTEX_TRYLOCK_PI:
++        if (is_cross_process)
++            return -LINUX_ENOSYS;
+         return futex_trylock_pi(g, uaddr);
+ 
+     default:
+@@ -1932,7 +2167,7 @@ int64_t sys_futex(guest_t *g,
+ 
+ int futex_wake_one(guest_t *g, uint64_t uaddr)
+ {
+-    return (int) futex_wake(g, uaddr, 1, FUTEX_BITSET_MATCH_ANY);
++    return (int) sys_futex(g, uaddr, FUTEX_WAKE, 1, 0, 0, FUTEX_BITSET_MATCH_ANY);
+ }
+ 
+ /* Unlink a waiter from whichever bucket it currently sits in, with retry on
+@@ -2115,6 +2350,16 @@ int64_t sys_futex_waitv(guest_t *g,
+          */
+         if (!futex_uaddr_is_aligned(elts[i].uaddr))
+             return -LINUX_EINVAL;
++
++        /* Cross-process shared mapping guard: Darwin ulock does not support
++         * multi-address waitv across processes. If any element targets a
++         * MAP_SHARED region without FUTEX2_PRIVATE, reject with -ENOSYS.
++         */
++        bool is_private = (elts[i].flags & FUTEX2_PRIVATE) != 0;
++        const guest_region_t *r = guest_region_find(g, elts[i].uaddr);
++        if (!is_private && r != NULL && r->shared) {
++            return -LINUX_ENOSYS;
++        }
+     }
+ 
+     waitv_shared_t shared;
+diff --git a/src/runtime/futex.h b/src/runtime/futex.h
+index 642242b..ce4c31a 100644
+--- a/src/runtime/futex.h
++++ b/src/runtime/futex.h
+@@ -75,3 +75,7 @@ int64_t sys_futex_waitv(guest_t *g,
+  * EOWNERDEAD.
+  */
+ void robust_list_walk(guest_t *g, thread_entry_t *t);
++
++/* Generalized Re-entrant Once Diagnostic Release (Task-97) */
++void once_track_enter(uint64_t uaddr, uint32_t word);
++bool once_is_active_for_thread(uint64_t uaddr);
+diff --git a/src/runtime/thread.c b/src/runtime/thread.c
+index dc9260a..ee2f0f6 100644
+--- a/src/runtime/thread.c
++++ b/src/runtime/thread.c
+@@ -303,6 +303,17 @@ rescan:
+         break;
+     }
+     pthread_mutex_unlock(&thread_lock);
++    if (result && getenv("ELFUSE_THREAD_LIFETIME_OBSERVE")) {
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        uint64_t us = (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
++        char line[256];
++        int n = snprintf(line, sizeof(line),
++            "THREAD_LIFETIME_EVENT ts_us=%llu pid=%ld gtid=%lld event=thread_alloc active_count=%d%c",
++            (unsigned long long)us, (long)getpid(), (long long)tid,
++            atomic_load_explicit(&active_thread_count, memory_order_relaxed), 10);
++        if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++    }
+ 
+     return result;
+ }
+@@ -425,6 +436,17 @@ void thread_deactivate(thread_entry_t *t)
+     thread_ptrace_cleanup_locked(t);
+ 
+     pthread_mutex_unlock(&thread_lock);
++    if (getenv("ELFUSE_THREAD_LIFETIME_OBSERVE")) {
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        uint64_t us = (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
++        char line[256];
++        int n = snprintf(line, sizeof(line),
++            "THREAD_LIFETIME_EVENT ts_us=%llu pid=%ld gtid=%lld event=thread_deactivate active_count=%d%c",
++            (unsigned long long)us, (long)getpid(), t ? (long long)t->guest_tid : -1LL,
++            atomic_load_explicit(&active_thread_count, memory_order_relaxed), 10);
++        if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++    }
+ 
+     /* The slot is now inactive, so thread_pending_union() excludes it.
+      * Recompute the global pending hint so any thread-directed signal left
+diff --git a/src/syscall/exec.c b/src/syscall/exec.c
+index 33074b2..51072a4 100644
+--- a/src/syscall/exec.c
++++ b/src/syscall/exec.c
+@@ -1917,6 +1917,8 @@ int64_t sys_execve(hv_vcpu_t vcpu,
+     }
+ 
+     guest_reset(g);
++    extern void once_count_exec_reset(void);
++    once_count_exec_reset();
+ 
+     /* The replacement image must not inherit process-wide shutdown requests
+      * from the old thread group.
+diff --git a/src/syscall/io.c b/src/syscall/io.c
+index 76fcbbb..efac439 100644
+--- a/src/syscall/io.c
++++ b/src/syscall/io.c
+@@ -26,6 +26,7 @@
+ #include <sys/stat.h>
+ #include <sys/uio.h>
+ #include <sys/socket.h>
++#include <sys/un.h>
+ #include <sys/ioctl.h>
+ #include <poll.h>
+ #include <termios.h>
+@@ -57,6 +58,108 @@
+ #include "syscall/signal.h"
+ #include "syscall/wakeup-pipe.h"
+ 
++
++/* Diagnostic-only metadata, no data payloads or changed I/O outcomes. */
++static _Thread_local bool fixture_step3_seen;
++static _Thread_local unsigned poststep_entries;
++bool io_fixture_identity_active(void);
++bool io_fixture_identity_active(void) { return fixture_step3_seen; }
++static _Thread_local int io_observer_gfd = -1;
++static _Thread_local uint64_t io_observer_want;
++static void io_observe_wait(int host_fd, short events, int64_t elapsed)
++{
++    static unsigned emitted;
++    unsigned slot = __atomic_fetch_add(&emitted, 1, __ATOMIC_RELAXED);
++    if (slot >= 32) return;
++    int saved_errno = errno;
++    struct stat st = {0};
++    int flags = fcntl(host_fd, F_GETFL);
++    int stat_ok = fstat(host_fd, &st) == 0;
++    int peer = -1, peer_error = 0;
++#ifdef LOCAL_PEERPID
++    if (stat_ok && S_ISSOCK(st.st_mode)) {
++        socklen_t size = sizeof(peer);
++        if (getsockopt(host_fd, SOL_LOCAL, LOCAL_PEERPID, &peer, &size) < 0)
++            peer_error = errno;
++    }
++#endif
++    uint64_t tid = 0;
++    (void)pthread_threadid_np(NULL, &tid);
++    uint64_t elr = 0, lr = 0;
++    int elr_status = -1, lr_status = -1;
++    long long guest_tid = -1;
++    int syscall_nr = -1;
++    if (current_thread && current_thread->vcpu_valid) {
++        guest_tid = (long long)current_thread->guest_tid;
++        syscall_nr = current_thread->in_syscall;
++        elr_status = (int)hv_vcpu_get_sys_reg(current_thread->vcpu, HV_SYS_REG_ELR_EL1, &elr);
++        lr_status = (int)hv_vcpu_get_reg(current_thread->vcpu, HV_REG_LR, &lr);
++    }
++    char line[640];
++    int n = snprintf(line, sizeof(line),
++        "IO_WAIT_OBS_V2 pid=%ld tid=%llu slot=%u gfd=%d hfd=%d events=0x%x want=%llu elapsed_ms=%lld "
++        "stat_ok=%d mode=0x%x dev=%llu ino=%llu hostflags=0x%x peerpid=%d peer_error=%d "
++        "gtid=%lld syscall=%d elr=0x%llx lr=0x%llx elr_status=0x%x lr_status=0x%x\n",
++        (long)getpid(), (unsigned long long)tid, slot, io_observer_gfd,
++        host_fd, events, (unsigned long long)io_observer_want,
++        (long long)elapsed, stat_ok, (unsigned)(st.st_mode & S_IFMT),
++        (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
++        flags, peer, peer_error, guest_tid, syscall_nr,
++        (unsigned long long)elr, (unsigned long long)lr, elr_status, lr_status);
++    if (n > 0 && (size_t)n < sizeof(line))
++        (void)write(STDERR_FILENO, line, (size_t)n);
++    errno = saved_errno;
++}
++
++
++/* Fixture-only observer: each thread scans at most 64 KiB per process image. */
++static void fixture_identity_observe(int gfd, int hfd, const struct iovec *iov, int nvec)
++{
++    if (!getenv("ELFUSE_FIXTURE_IDENTITY")) return;
++    static _Thread_local size_t progress, scanned;
++    static _Thread_local dev_t stream_dev;
++    static _Thread_local ino_t stream_ino;
++    static unsigned emitted;
++    static const char marker[] = "[WIN_ARM64_VK] Step 3: Calling vkCreateInstance(API=1.0)...";
++    int saved_errno = errno;
++    struct stat out, actual;
++    if (fstat(STDOUT_FILENO, &out) < 0 || fstat(hfd, &actual) < 0 ||
++        out.st_dev != actual.st_dev || out.st_ino != actual.st_ino ||
++        (out.st_mode & S_IFMT) != (actual.st_mode & S_IFMT)) {
++        progress = 0;
++        errno = saved_errno;
++        return;
++    }
++    if (stream_dev != actual.st_dev || stream_ino != actual.st_ino) {
++        progress = 0;
++        stream_dev = actual.st_dev;
++        stream_ino = actual.st_ino;
++    }
++    for (int j = 0; j < nvec && scanned < 65536; j++) {
++        const unsigned char *bytes = iov[j].iov_base;
++        size_t len = iov[j].iov_len;
++        if (len > 65536 - scanned) len = 65536 - scanned;
++        for (size_t i = 0; i < len; i++) {
++            scanned++;
++            if (bytes[i] == (unsigned char)marker[progress]) progress++;
++            else progress = bytes[i] == (unsigned char)marker[0] ? 1 : 0;
++            if (progress == sizeof(marker)-1) {
++                fixture_step3_seen = true;
++                progress = 0;
++                if (__atomic_fetch_add(&emitted, 1, __ATOMIC_RELAXED) == 0) {
++                    char line[224];
++                    int n = snprintf(line, sizeof(line),
++                        "FIXTURE_STEP3_IDENTITY pid=%ld ppid=%ld gtid=%lld gfd=%d nvec=%d phase=write_request%c",
++                        (long)getpid(), (long)getppid(),
++                        current_thread ? (long long)current_thread->guest_tid : -1LL, gfd, nvec, 10);
++                    if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++                }
++            }
++        }
++    }
++    errno = saved_errno;
++}
++
+ #define URANDOM_CACHE_SIZE 4096
+ 
+ /* Linux terminal struct types. */
+@@ -269,6 +372,32 @@ int64_t io_wait_fd_timed_or_interrupted(int host_fd,
+                                         int timeout_ms)
+ {
+     int wake_fd = wakeup_pipe_read_fd();
++    bool observe = getenv("ELFUSE_IO_WAIT_OBSERVE") != NULL;
++    bool reported = false;
++    int64_t observe_start = observe ? io_now_ms() : 0;
++    if (observe && fixture_step3_seen && poststep_entries < 16) {
++        int saved_errno = errno;
++        uint64_t elr = 0, lr = 0;
++        int er = -1, lrr = -1;
++        struct stat st = {0};
++        int stat_ok = fstat(host_fd, &st) == 0;
++        long long gtid = -1;
++        int nr = -1;
++        if (current_thread && current_thread->vcpu_valid) {
++            er = (int)hv_vcpu_get_sys_reg(current_thread->vcpu, HV_SYS_REG_ELR_EL1, &elr);
++            lrr = (int)hv_vcpu_get_reg(current_thread->vcpu, HV_REG_LR, &lr);
++            gtid = (long long)current_thread->guest_tid;
++            nr = current_thread->in_syscall;
++        }
++        char line[384];
++        int n = snprintf(line, sizeof(line),
++            "POSTSTEP_WAIT_ENTRY pid=%ld seq=%u gtid=%lld syscall=%d gfd=%d hfd=%d events=0x%x want=%llu mode=0x%x stat_ok=%d ino=%llu elr=0x%llx lr=0x%llx er=0x%x lrr=0x%x%c",
++            (long)getpid(), poststep_entries++, gtid, nr, io_observer_gfd, host_fd,
++            events, (unsigned long long)io_observer_want, (unsigned)(st.st_mode & S_IFMT), stat_ok,
++            (unsigned long long)st.st_ino, (unsigned long long)elr, (unsigned long long)lr, er, lrr, 10);
++        if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++        errno = saved_errno;
++    }
+ 
+     /* An absolute deadline rather than a countdown: the 200 ms slices below
+      * exist to re-check interrupt conditions, and charging each one against a
+@@ -352,6 +481,10 @@ int64_t io_wait_fd_timed_or_interrupted(int host_fd,
+                 slice = (int) left;
+         }
+ 
++        if (observe && !reported && io_now_ms() - observe_start >= 2000) {
++            io_observe_wait(host_fd, events, io_now_ms() - observe_start);
++            reported = true;
++        }
+         int ret = poll(fds, 2, slice);
+         if (ret < 0)
+             return linux_errno();
+@@ -548,7 +681,11 @@ int64_t io_xfer(int fd,
+     unsigned backoff = 0, spins = 0;
+     for (;;) {
+         if (wait_first) {
++            io_observer_gfd = fd;
++            io_observer_want = want - (uint64_t)total;
+             int64_t waited = io_wait_fd_or_interrupted(host_fd, events);
++            io_observer_gfd = -1;
++            io_observer_want = 0;
+             if (waited < 0) {
+                 /* Interrupted, by a guest signal or by elfuse's own teardown
+                  * and execve-handoff wakes.
+@@ -1569,6 +1706,9 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
+     if (count > avail)
+         count = avail;
+ 
++    struct iovec fixture_iov = {.iov_base = buf, .iov_len = count};
++    fixture_identity_observe(fd, host_ref.fd, &fixture_iov, 1);
++
+     off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
+     if (offset >= 0) {
+         ssize_t intercepted = 0;
+@@ -2243,6 +2383,7 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
+         host_fd_ref_close(&host_ref);
+         return err;
+     }
++    fixture_identity_observe(fd, host_ref.fd, host_iov.iov, iovcnt);
+     if (!host_iov_has_payload(&host_iov, iovcnt)) {
+         err = io_check_access(host_ref.fd, POLLOUT);
+         host_iov_free(&host_iov);
+diff --git a/src/syscall/mem.c b/src/syscall/mem.c
+index 43dda4f..57ee759 100644
+--- a/src/syscall/mem.c
++++ b/src/syscall/mem.c
+@@ -33,6 +33,41 @@
+ #include "syscall/internal.h"
+ #include "syscall/mem.h"
+ 
++
++/* Diagnostic-only fork: bounded observations, never a mapping result. */
++static void mmap_file_observe(int guest_fd, int host_fd, int prot, int flags,
++                              uint64_t addr, uint64_t length, uint64_t offset)
++{
++    static unsigned int emitted;
++    if (!getenv("ELFUSE_MMAP_FILE_OBSERVE") || (prot & LINUX_PROT_EXEC))
++        return;
++    int saved_errno = errno;
++    struct stat st;
++    int access = fcntl(host_fd, F_GETFL);
++    if (access >= 0 && fstat(host_fd, &st) == 0 && S_ISREG(st.st_mode) &&
++        (st.st_nlink == 0 || (flags & LINUX_MAP_SHARED))) {
++        unsigned int slot = __atomic_fetch_add(&emitted, 1, __ATOMIC_RELAXED);
++        if (slot < 64) {
++            char line[448];
++            int n = snprintf(line, sizeof(line),
++                "MMAP_FILE_OBS_V1 pid=%ld slot=%u dev=%llu ino=%llu links=%u "
++                "gfd=%d hfd=%d access=%d prot=0x%x flags=0x%x "
++                "addr=0x%llx len=0x%llx off=0x%llx phase=request\n",
++                (long)getpid(), slot, (unsigned long long)st.st_dev,
++                (unsigned long long)st.st_ino, (unsigned int)st.st_nlink,
++                guest_fd, host_fd, access & O_ACCMODE, prot, flags,
++                (unsigned long long)addr, (unsigned long long)length,
++                (unsigned long long)offset);
++            if (n > 0 && (size_t)n < sizeof(line))
++                (void)write(STDERR_FILENO, line, (size_t)n);
++        } else if (slot == 64) {
++            static const char capped[] = "MMAP_FILE_OBS_V1 capped=64 phase=request\n";
++            (void)write(STDERR_FILENO, capped, sizeof(capped)-1);
++        }
++    }
++    errno = saved_errno;
++}
++
+ /* Protects mmap/brk bump allocators and page table extension. Multiple threads
+  * may call mmap/brk concurrently; without this lock they could get overlapping
+  * allocations or corrupt page table structures.
+@@ -2870,6 +2905,31 @@ int64_t sys_mmap(guest_t *g,
+                  int fd,
+                  int64_t offset)
+ {
++    /* NOT AN ABI FIX: gated causal experiment sacrificing private-write isolation. */
++    if (getenv("ELFUSE_DIAG_SESSION_SHARED") && fd >= 0 &&
++        length == 0x144000 && offset == 0 && prot == (LINUX_PROT_READ | LINUX_PROT_WRITE) &&
++        (flags & LINUX_MAP_PRIVATE) && !(flags & LINUX_MAP_ANONYMOUS)) {
++        int saved_errno = errno;
++        host_fd_ref_t diagnostic_ref = HOST_FD_REF_INIT;
++        if (host_fd_ref_open(fd, &diagnostic_ref) >= 0) {
++            struct stat st;
++            int access = fcntl(diagnostic_ref.fd, F_GETFL);
++            if (access >= 0 && (access & O_ACCMODE) == O_RDWR &&
++                fstat(diagnostic_ref.fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 0) {
++                char line[256];
++                int n = snprintf(line, sizeof(line),
++                    "DIAGNOSTIC_SHARED_ALIAS_NOT_ABI_FIX pid=%ld dev=%llu ino=%llu len=0x144000 old_flags=0x%x\n",
++                    (long)getpid(), (unsigned long long)st.st_dev,
++                    (unsigned long long)st.st_ino, flags);
++                if (n > 0 && (size_t)n < sizeof(line))
++                    (void)write(STDERR_FILENO, line, (size_t)n);
++                flags = (flags & ~LINUX_MAP_PRIVATE) | LINUX_MAP_SHARED;
++            }
++            host_fd_ref_close(&diagnostic_ref);
++        }
++        errno = saved_errno;
++    }
++
+     bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
+     bool needs_exec = (prot & LINUX_PROT_EXEC) != 0;
+     bool is_prot_none = (prot == LINUX_PROT_NONE);
+@@ -2993,8 +3053,14 @@ int64_t sys_mmap(guest_t *g,
+          * runtime fields rather than compile-time low-memory constants.
+          */
+         uint64_t fix_end = off + length;
+-        if (guest_range_hits_infra(g, off, fix_end))
++        if (guest_range_hits_infra(g, off, fix_end)) {
++            uint64_t lo = 0, hi = 0;
++            guest_infra_window(g, &lo, &hi);
++            log_warn("mmap MAP_FIXED rejected by infra reserve: [0x%llx, 0x%llx) overlaps infra [0x%llx, 0x%llx)",
++                     (unsigned long long) off, (unsigned long long) fix_end,
++                     (unsigned long long) lo, (unsigned long long) hi);
+             return -LINUX_EINVAL;
++        }
+ 
+         result_off = off;
+ 
+@@ -3025,6 +3091,7 @@ int64_t sys_mmap(guest_t *g,
+                 return ref_err;
+             }
+             host_backing_fd = fresh.backing_ref.fd;
++            mmap_file_observe(fd, host_backing_fd, prot, flags, addr, length, offset);
+         }
+ 
+         remove_range_t replaced = {result_off, result_off + length};
+@@ -3252,6 +3319,7 @@ int64_t sys_mmap(guest_t *g,
+                 return ref_err;
+             }
+             host_backing_fd = fresh.backing_ref.fd;
++            mmap_file_observe(fd, host_backing_fd, prot, flags, addr, length, offset);
+         }
+ 
+         /* Prefer stage-2 2 MiB block boundaries for non-fixed MAP_SHARED
+diff --git a/src/syscall/net-absock.c b/src/syscall/net-absock.c
+index 80b6757..40202e8 100644
+--- a/src/syscall/net-absock.c
++++ b/src/syscall/net-absock.c
+@@ -82,13 +82,92 @@ static int absock_link_count;
+ 
+ static void absock_cleanup(void);
+ 
++/* Check whether a custom base directory specified via ELFUSE_ABSOCK_BASE is secure.
++ * Must be an absolute path, not a symlink (including when specified with a trailing slash),
++ * owned by getuid(), mode user-only (no group or other permissions).
++ * Returns 0 on success, or -1 with errno set:
++ *   EINVAL: not absolute, or empty string
++ *   ENOENT / ENOTDIR / EACCES: path lookup or permission violation
++ *   ELOOP: symlink detected
++ *   ENAMETOOLONG: total path would exceed sun_path budget
++ */
++static int absock_validate_custom_base(const char *base, char *clean_out, size_t clean_sz)
++{
++    if (!base || base[0] != '/') {
++        errno = EINVAL;
++        return -1;
++    }
++
++    size_t len = strlen(base);
++    if (len == 0 || len >= 60) {
++        errno = (len >= 60) ? ENAMETOOLONG : EINVAL;
++        return -1;
++    }
++
++    /* Strip any trailing slashes FIRST so lstat inspects the leaf link itself,
++     * not the link target (macOS lstat on a path with a trailing slash follows symlinks!).
++     */
++    size_t blen = len;
++    while (blen > 1 && base[blen - 1] == '/')
++        blen--;
++
++    if (blen >= clean_sz) {
++        errno = ENAMETOOLONG;
++        return -1;
++    }
++    memcpy(clean_out, base, blen);
++    clean_out[blen] = '\0';
++
++    struct stat st;
++    if (lstat(clean_out, &st) < 0)
++        return -1;
++
++    if (S_ISLNK(st.st_mode)) {
++        errno = ELOOP;
++        return -1;
++    }
++
++    if (!S_ISDIR(st.st_mode)) {
++        errno = ENOTDIR;
++        return -1;
++    }
++
++    if (st.st_uid != getuid() || (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
++        errno = EACCES;
++        return -1;
++    }
++
++    return 0;
++}
++
+ /* Spell the namespace directory for @namespace_id. Shared so a reader can name
+  * the directory without depending on this process being the one that created
+  * it, which is not the same thing: fork spawns a fresh process that inherits
+  * the id and reads back sockaddrs pointing into the shared dir.
++ *
++ * If ELFUSE_ABSOCK_BASE is set (including set-empty), validates it strictly.
++ * An invalid or set-empty base fails immediately with errno without fallback to /tmp.
++ * To preserve ample sun_path budget (< 104) for PID prefixes and FNV-1a digests,
++ * custom base uses the compact sub-directory format "/n%016llx" (18 bytes).
++ * Only an unset env defaults to /tmp with the legacy "/tmp/elfuse-absock-%llu".
+  */
+ static int absock_dir_format(char *out, size_t out_sz, uint64_t namespace_id)
+ {
++    const char *custom_base = getenv("ELFUSE_ABSOCK_BASE");
++    if (custom_base) {
++        char clean_base[64];
++        if (absock_validate_custom_base(custom_base, clean_base, sizeof(clean_base)) < 0)
++            return -1;
++
++        int n = snprintf(out, out_sz, "%s/n%016llx",
++                         clean_base, (unsigned long long) namespace_id);
++        if (n < 0 || (size_t) n >= out_sz || (size_t) n > 72) {
++            errno = ENAMETOOLONG;
++            return -1;
++        }
++        return n;
++    }
++
+     return snprintf(out, out_sz, "/tmp/elfuse-absock-%llu",
+                     (unsigned long long) namespace_id);
+ }
+@@ -111,7 +190,8 @@ static int absock_ensure_dir_locked(void)
+         return create_private_dir(absock_dir);
+     }
+ 
+-    absock_dir_format(absock_dir, sizeof(absock_dir), namespace_id);
++    if (absock_dir_format(absock_dir, sizeof(absock_dir), namespace_id) < 0)
++        return -1;
+ 
+     /* The namespace-id path is guessable; create_private_dir rejects a
+      * pre-planted symlink or foreign-owned directory in world-writable /tmp.
+diff --git a/src/syscall/net.c b/src/syscall/net.c
+index fd91d4c..ee44dfe 100644
+--- a/src/syscall/net.c
++++ b/src/syscall/net.c
+@@ -549,7 +549,7 @@ int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
+         }
+         if (absock_idx < 0) {
+             host_fd_ref_close(&host_ref);
+-            return -LINUX_EINVAL;
++            return linux_errno();
+         }
+         mac_len = bind_len;
+     } else {
+diff --git a/src/syscall/proc.c b/src/syscall/proc.c
+index c127a54..00c24c0 100644
+--- a/src/syscall/proc.c
++++ b/src/syscall/proc.c
+@@ -3085,6 +3085,7 @@ static _Atomic uint64_t g_vcpu_progress;
+ 
+ static pthread_t g_preempt_thread;
+ static bool g_preempt_started;
++static _Atomic bool g_preempt_stop_requested;
+ 
+ static void drain_external_guest_signal(void);
+ 
+@@ -3104,9 +3105,13 @@ static void *preempt_thread_main(void *arg)
+     sigaddset(&wait_set, SIGALRM);
+ 
+     for (;;) {
++        if (atomic_load_explicit(&g_preempt_stop_requested, memory_order_acquire))
++            break;
+         int sig = 0;
+         if (sigwait(&wait_set, &sig) != 0)
+             continue;
++        if (atomic_load_explicit(&g_preempt_stop_requested, memory_order_acquire))
++            break;
+         if (sig == SIGUSR2) {
+             atomic_store_explicit(&g_external_guest_signal, 1,
+                                   memory_order_release);
+@@ -3217,6 +3222,12 @@ static void unlink_own_transport(void)
+     close(fd);
+ }
+ 
++static void proc_preempt_atfork_child(void)
++{
++    g_preempt_started = false;
++    atomic_store_explicit(&g_preempt_stop_requested, false, memory_order_relaxed);
++}
++
+ /* Call once from the main thread before any vCPU thread is created; the
+  * fork-child re-runs it in its own process. Not safe against concurrent callers
+  * (the g_preempt_started guard is a plain bool), which is fine because every
+@@ -3253,6 +3264,16 @@ int proc_preempt_init(void)
+         return -1;
+     }
+ 
++    static bool atfork_registered = false;
++    if (!atfork_registered) {
++        int aerr = pthread_atfork(NULL, NULL, proc_preempt_atfork_child);
++        if (aerr != 0) {
++            log_error("elfuse: pthread_atfork failed: %s", strerror(aerr));
++            return -1;
++        }
++        atfork_registered = true;
++    }
++
+     int err =
+         pthread_create(&g_preempt_thread, NULL, preempt_thread_main, NULL);
+     if (err != 0) {
+@@ -3266,7 +3287,42 @@ int proc_preempt_init(void)
+         return -1;
+     }
+     g_preempt_started = true;
+-    atexit(unlink_own_transport);
++    static bool atexit_registered = false;
++    if (!atexit_registered) {
++        atexit(unlink_own_transport);
++        atexit_registered = true;
++    }
++    return 0;
++}
++
++int proc_preempt_stop(void)
++{
++    if (!g_preempt_started)
++        return 0;
++
++    /* Prevent self-join deadlock */
++    if (pthread_equal(pthread_self(), g_preempt_thread)) {
++        log_error("elfuse: proc_preempt_stop called from preemption thread itself");
++        return -1;
++    }
++
++    atomic_store_explicit(&g_preempt_stop_requested, true, memory_order_release);
++    int kerr = pthread_kill(g_preempt_thread, SIGALRM);
++    if (kerr != 0 && kerr != ESRCH) {
++        log_error("elfuse: pthread_kill preemption thread failed: %s",
++                  strerror(kerr));
++        return -1;
++    }
++
++    int jerr = pthread_join(g_preempt_thread, NULL);
++    if (jerr != 0) {
++        log_error("elfuse: pthread_join preemption thread failed: %s",
++                  strerror(jerr));
++        return -1;
++    }
++
++    g_preempt_started = false;
++    atomic_store_explicit(&g_preempt_stop_requested, false, memory_order_relaxed);
+     return 0;
+ }
+ 
+@@ -3722,6 +3778,11 @@ static bool vcpu_handle_brk(guest_t *g,
+     uint64_t brk_pc;
+     hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &brk_pc);
+ 
++    extern bool once_count_handle_brk(guest_t *g, hv_vcpu_t vcpu, uint64_t brk_pc);
++    if (once_count_handle_brk(g, vcpu, brk_pc)) {
++        return true; /* Intercepted by once entry counter, resume guest directly */
++    }
++
+     if (verbose) {
+         log_debug("%s: BRK at 0x%llx -> %s", prefix,
+                   (unsigned long long) brk_pc,
+diff --git a/src/syscall/proc.h b/src/syscall/proc.h
+index ad4303d..22bc802 100644
+--- a/src/syscall/proc.h
++++ b/src/syscall/proc.h
+@@ -577,6 +577,7 @@ int proc_send_guest_signal(pid_t host_pid,
+  * this process).
+  */
+ int proc_preempt_init(void);
++int proc_preempt_stop(void);
+ 
+ /* Syscall handlers. */
+ int64_t sys_pidfd_open(guest_t *g, int64_t pid, unsigned int flags);
+diff --git a/src/syscall/syscall.c b/src/syscall/syscall.c
+index 572d23a..5db1229 100644
+--- a/src/syscall/syscall.c
++++ b/src/syscall/syscall.c
+@@ -39,7 +39,10 @@
+ #include <sched.h>
+ #include <signal.h>
+ #include <stdatomic.h>
++#include <sys/param.h>
+ 
++#include "core/guest.h"
++#include "runtime/thread.h"
+ #include "debug/log.h"
+ #include "utils.h"
+ 
+@@ -2540,6 +2543,596 @@ void syscall_restart_cancel(hv_vcpu_t vcpu)
+     hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) cpu_restart_req.result);
+ }
+ 
++/* =========================================================================
++ * Futex Owner & Module Attribution Observer (Task-70 / Round 36)
++ * ========================================================================= */
++static void futex_owner_log_mapping(const guest_t *g, const char *tag, uint64_t addr)
++{
++    const guest_region_t *r = guest_region_find(g, addr);
++    if (!r) {
++        char line[256];
++        int n = snprintf(line, sizeof(line),
++            "FUTEX_OWNER_MAP tag=%s addr=0x%llx mod=[unmapped] off=0x0 start=0x0 end=0x0 prot=--- flags=0x0 resolved=0%c",
++            tag, (unsigned long long)addr, 10);
++        if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++        return;
++    }
++
++    char mod[MAXPATHLEN];
++    mod[0] = '\0';
++    if (r->backing_fd >= 0 && fcntl(r->backing_fd, F_GETPATH, mod) == 0) {
++        /* Full host path from backing fd */
++    } else if (r->name[0] != '\0') {
++        snprintf(mod, sizeof(mod), "%s", r->name);
++    } else if (r->backing_fd >= 0) {
++        snprintf(mod, sizeof(mod), "[fd:%d]", r->backing_fd);
++    } else if (r->flags & LINUX_MAP_ANONYMOUS) {
++        snprintf(mod, sizeof(mod), "[anon]");
++    } else {
++        snprintf(mod, sizeof(mod), "[unknown]");
++    }
++
++    uint64_t off = (r->backing_fd >= 0) ? (r->offset + (addr - r->start)) : (addr - r->start);
++    char prot[4] = {
++        (r->prot & 1) ? 'r' : '-',
++        (r->prot & 2) ? 'w' : '-',
++        (r->prot & 4) ? 'x' : '-',
++        '\0'
++    };
++
++    char line[512];
++    int n = snprintf(line, sizeof(line),
++        "FUTEX_OWNER_MAP tag=%s addr=0x%llx mod=%s off=0x%llx start=0x%llx end=0x%llx prot=%s flags=0x%x resolved=1%c",
++        tag, (unsigned long long)addr, mod, (unsigned long long)off,
++        (unsigned long long)r->start, (unsigned long long)r->end, prot, r->flags, 10);
++    if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++}
++
++struct futex_owner_dump_ctx {
++    pid_t pid;
++    int64_t caller_gtid;
++    uint64_t uaddr;
++};
++
++static void futex_owner_thread_cb(thread_entry_t *t, void *ctx_ptr)
++{
++    struct futex_owner_dump_ctx *ctx = (struct futex_owner_dump_ctx *)ctx_ptr;
++    if (!t) return;
++    int64_t sib_gtid = (int64_t)t->guest_tid;
++    int in_sc = (int)atomic_load_explicit(&t->in_syscall, memory_order_relaxed);
++    uint32_t kick = (uint32_t)atomic_load_explicit(&t->futex_kick, memory_order_relaxed);
++    int is_parked = (t->futex_park_cond != NULL) ? 1 : 0;
++
++    char line[256];
++    int n = snprintf(line, sizeof(line),
++        "FUTEX_OWNER_THREAD pid=%ld caller_gtid=%lld sibling_gtid=%lld in_syscall=%d futex_kick=%u parked=%d%c",
++        (long)ctx->pid, (long long)ctx->caller_gtid, (long long)sib_gtid, in_sc, kick, is_parked, 10);
++    if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++}
++
++/* =========================================================================
++ * Thread Table Snapshot & Watchdog (Task-72)
++ * ========================================================================= */
++static void dump_thread_table_snapshot(const char *trigger)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    uint64_t us = (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
++
++    char hdr[256];
++    int hn = snprintf(hdr, sizeof(hdr),
++        "THREAD_SNAPSHOT_BEGIN ts_us=%llu pid=%ld trigger=%s active_count=%d%c",
++        (unsigned long long)us, (long)getpid(), trigger,
++        thread_active_count(), 10);
++    if (hn > 0 && (size_t)hn < sizeof(hdr)) (void)write(STDERR_FILENO, hdr, (size_t)hn);
++
++    struct futex_owner_dump_ctx ctx = { getpid(), current_thread ? current_thread->guest_tid : -1LL, 0 };
++    thread_for_each(futex_owner_thread_cb, &ctx);
++
++    char ftr[128];
++    int fn = snprintf(ftr, sizeof(ftr), "THREAD_SNAPSHOT_END ts_us=%llu pid=%ld%c", (unsigned long long)us, (long)getpid(), 10);
++    if (fn > 0 && (size_t)fn < sizeof(ftr)) (void)write(STDERR_FILENO, ftr, (size_t)fn);
++}
++
++static void *thread_lifetime_watchdog_thread(void *arg)
++{
++    (void)arg;
++    while (1) {
++        sleep(1);
++        dump_thread_table_snapshot("watchdog_1s");
++    }
++    return NULL;
++}
++
++static pthread_once_t thread_watchdog_once = PTHREAD_ONCE_INIT;
++static void thread_watchdog_init_fn(void)
++{
++    pthread_t th;
++    if (pthread_create(&th, NULL, thread_lifetime_watchdog_thread, NULL) == 0) {
++        pthread_detach(th);
++    }
++}
++
++/* =========================================================================
++ * Once Word Transition Sampler (Task-74)
++ * ========================================================================= */
++static uint64_t once_trace_target_uaddr = 0x20102d440ULL;
++static pthread_mutex_t once_trace_lock = PTHREAD_MUTEX_INITIALIZER;
++static bool once_trace_first_read = true;
++static bool once_trace_was_mapped = false;
++static uint32_t once_trace_last_val = 0;
++static uint64_t once_trace_sample_count = 0;
++static const guest_t *once_trace_guest_ptr = NULL;
++static _Atomic bool once_trace_stop_sampler = false;
++static _Atomic bool once_trace_sampler_armed = false;
++static _Atomic uint64_t last_main_elr = 0;
++static _Atomic uint64_t last_main_lr = 0;
++
++static void check_and_log_once_transition(const guest_t *g, const char *trigger, uint64_t cur_elr, uint64_t cur_lr)
++{
++    if (!g) return;
++    pthread_mutex_lock(&once_trace_lock);
++    once_trace_sample_count++;
++
++    const guest_region_t *r = guest_region_find(g, once_trace_target_uaddr);
++    bool is_mapped = (r != NULL);
++    uint32_t cur_val = 0;
++    if (is_mapped) {
++        (void)guest_read_small(g, once_trace_target_uaddr, &cur_val, sizeof(cur_val));
++    }
++
++    bool cond_a = (!once_trace_was_mapped && is_mapped);
++    bool cond_b = (once_trace_was_mapped && is_mapped && (cur_val != once_trace_last_val));
++    bool cond_c = once_trace_first_read;
++
++    if (cond_a || cond_b || cond_c) {
++        if (cur_elr == 0 && cur_lr == 0) {
++            cur_elr = atomic_load_explicit(&last_main_elr, memory_order_relaxed);
++            cur_lr = atomic_load_explicit(&last_main_lr, memory_order_relaxed);
++        }
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        uint64_t us = (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
++
++        const char *reason = cond_b ? "val_change" : (cond_a ? "first_mapped" : "first_read");
++
++        char line[512];
++        int n = snprintf(line, sizeof(line),
++            "ONCE_TRANSITION ts_us=%llu pid=%ld gtid=%lld uaddr=0x%llx val=0x%x (dec:%u) prev_val=0x%x mapped=%d range=[0x%llx,0x%llx) prot=%s reason=%s elr=0x%llx lr=0x%llx trigger=%s%c",
++            (unsigned long long)us, (long)getpid(), current_thread ? (long long)current_thread->guest_tid : -1LL,
++            (unsigned long long)once_trace_target_uaddr, cur_val, cur_val, once_trace_last_val,
++            is_mapped ? 1 : 0,
++            is_mapped ? (unsigned long long)r->start : 0ULL,
++            is_mapped ? (unsigned long long)r->end : 0ULL,
++            is_mapped ? ((r->prot & 2) ? "rw-" : "r--") : "---",
++            reason,
++            (unsigned long long)cur_elr, (unsigned long long)cur_lr,
++            trigger, 10);
++        if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++
++        once_trace_last_val = cur_val;
++        once_trace_was_mapped = is_mapped;
++        once_trace_first_read = false;
++
++        /* Map attribution for transition ELR and LR per Task-79 */
++        if (cond_b && cur_val == 1) {
++            futex_owner_log_mapping(g, "transition_elr", cur_elr);
++            futex_owner_log_mapping(g, "transition_lr", cur_lr);
++            futex_owner_log_mapping(g, "transition_uaddr", once_trace_target_uaddr);
++        }
++    }
++    pthread_mutex_unlock(&once_trace_lock);
++}
++
++/* =========================================================================
++ * ELR Category Classification & Re-entry Timeline (Task-79)
++ * ========================================================================= */
++typedef enum {
++    CAT_UNKNOWN = 0,
++    CAT_LIBC_ONCE_SLOW,    /* 0x2000ce000 .. 0x2000ce120 (libc once slow path) */
++    CAT_LIBC_OTHER,        /* other code in libc.so.6 */
++    CAT_LOADER_RX,         /* 0x10000000 .. 0x10200000 (0x1004xxxx / 0x1002xxxx) */
++    CAT_LAVAPIPE,          /* libvulkan_lvp.so / libLLVM */
++    CAT_WINE,              /* ntdll.so, win32u.so, winevulkan.so, wine */
++    CAT_OTHER              /* any other guest code */
++} elr_category_t;
++
++static const char *elr_category_name(elr_category_t cat) {
++    switch (cat) {
++    case CAT_LIBC_ONCE_SLOW: return "libc_once_slow";
++    case CAT_LIBC_OTHER: return "libc_other";
++    case CAT_LOADER_RX: return "loader_rx";
++    case CAT_LAVAPIPE: return "lavapipe";
++    case CAT_WINE: return "wine";
++    case CAT_OTHER: return "other";
++    default: return "unknown";
++    }
++}
++
++static elr_category_t classify_elr(const guest_t *g, uint64_t elr, char *mod_out, size_t mod_sz, uint64_t *off_out) {
++    if (mod_out && mod_sz > 0) mod_out[0] = '\0';
++    if (off_out) *off_out = 0;
++    if (!g || elr == 0) return CAT_UNKNOWN;
++
++    if (elr >= 0x10000000ULL && elr < 0x10200000ULL) {
++        if (mod_out) snprintf(mod_out, mod_sz, "loader_rx");
++        if (off_out) *off_out = elr - 0x10000000ULL;
++        return CAT_LOADER_RX;
++    }
++
++    const guest_region_t *r = guest_region_find(g, elr);
++    if (!r) {
++        if (mod_out) snprintf(mod_out, mod_sz, "[unmapped]");
++        return CAT_OTHER;
++    }
++
++    char mod[MAXPATHLEN];
++    mod[0] = '\0';
++    if (r->backing_fd >= 0 && fcntl(r->backing_fd, F_GETPATH, mod) == 0) {
++        /* host path */
++    } else if (r->name[0] != '\0') {
++        snprintf(mod, sizeof(mod), "%s", r->name);
++    } else {
++        snprintf(mod, sizeof(mod), "[anon]");
++    }
++
++    if (mod_out) snprintf(mod_out, mod_sz, "%s", mod);
++    if (off_out) *off_out = (r->backing_fd >= 0) ? (r->offset + (elr - r->start)) : (elr - r->start);
++
++    if (strstr(mod, "libc.so") != NULL) {
++        if (elr >= 0x2000ce000ULL && elr <= 0x2000ce120ULL) {
++            return CAT_LIBC_ONCE_SLOW;
++        }
++        if (off_out && *off_out >= 0x8e000 && *off_out <= 0x8e120) {
++            return CAT_LIBC_ONCE_SLOW;
++        }
++        return CAT_LIBC_OTHER;
++    }
++    if (strstr(mod, "vulkan_lvp") != NULL || strstr(mod, "LLVM") != NULL) {
++        return CAT_LAVAPIPE;
++    }
++    if (strstr(mod, "wine") != NULL || strstr(mod, "ntdll") != NULL || strstr(mod, "win32u") != NULL) {
++        return CAT_WINE;
++    }
++    return CAT_OTHER;
++}
++
++static _Atomic elr_category_t last_sampled_cat = CAT_UNKNOWN;
++
++static void update_and_log_category(const guest_t *g, uint64_t cur_elr, const char *trigger) {
++    if (!g || cur_elr == 0) return;
++    if (!atomic_load_explicit(&once_trace_sampler_armed, memory_order_relaxed)) return;
++    char mod[MAXPATHLEN];
++    uint64_t off = 0;
++    elr_category_t cur_cat = classify_elr(g, cur_elr, mod, sizeof(mod), &off);
++    elr_category_t prev_cat = atomic_load_explicit(&last_sampled_cat, memory_order_relaxed);
++
++    if (cur_cat != prev_cat) {
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        uint64_t us = (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
++        char line[512];
++        int n = snprintf(line, sizeof(line),
++            "REENTRY_TIMELINE ts_us=%llu pid=%ld gtid=1 elr=0x%llx cat=%s prev_cat=%s mod=%s off=0x%llx trigger=%s%c",
++            (unsigned long long)us, (long)getpid(), (unsigned long long)cur_elr,
++            elr_category_name(cur_cat), elr_category_name(prev_cat),
++            mod, (unsigned long long)off, trigger, 10);
++        if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++        atomic_store_explicit(&last_sampled_cat, cur_cat, memory_order_relaxed);
++    }
++}
++
++__attribute__((unused)) static void *once_trace_sampler_thread_fn(void *arg)
++{
++    (void)arg;
++    while (!atomic_load_explicit(&once_trace_stop_sampler, memory_order_acquire)) {
++        usleep(300); // 300 us high frequency sampling per Task-79 (200-500us)
++        if (atomic_load_explicit(&once_trace_stop_sampler, memory_order_acquire)) break;
++        if (once_trace_guest_ptr) {
++            check_and_log_once_transition(once_trace_guest_ptr, "poll_300us", 0, 0);
++            uint64_t cur_elr = atomic_load_explicit(&last_main_elr, memory_order_relaxed);
++            update_and_log_category(once_trace_guest_ptr, cur_elr, "poll_300us");
++        }
++    }
++    return NULL;
++}
++
++static pthread_once_t once_sampler_thread_once = PTHREAD_ONCE_INIT;
++__attribute__((unused)) static void once_sampler_init_fn(void)
++{
++    const char *target_env = getenv("ELFUSE_ONCE_TRACE_UADDR");
++    if (target_env && target_env[0] != '\0') {
++        once_trace_target_uaddr = strtoull(target_env, NULL, 0);
++    }
++}
++
++/* =========================================================================
++ * Instruction-Level once Entry Counter (Task-82)
++ * ========================================================================= */
++bool once_count_handle_brk(guest_t *g, hv_vcpu_t vcpu, uint64_t brk_pc);
++
++static void resolve_addr_module(const guest_t *g, uint64_t addr, char *mod_buf, size_t mod_sz, uint64_t *off_out)
++{
++    const guest_region_t *r = guest_region_find(g, addr);
++    if (!r) {
++        snprintf(mod_buf, mod_sz, "[unmapped]");
++        *off_out = 0;
++        return;
++    }
++    mod_buf[0] = '\0';
++    if (r->backing_fd >= 0 && fcntl(r->backing_fd, F_GETPATH, mod_buf) == 0) {
++        /* Full host path from backing fd */
++    } else if (r->name[0] != '\0') {
++        snprintf(mod_buf, mod_sz, "%s", r->name);
++    } else if (r->flags & LINUX_MAP_ANONYMOUS) {
++        snprintf(mod_buf, mod_sz, "[anon]");
++    } else {
++        snprintf(mod_buf, mod_sz, "[unknown]");
++    }
++    *off_out = (r->backing_fd >= 0) ? (r->offset + (addr - r->start)) : (addr - r->start);
++}
++
++void once_count_exec_reset(void);
++
++
++
++static uint64_t once_count_target_uaddr = 0x20102d440ULL;
++static uint64_t once_count_libc_base = 0;
++static uint64_t once_count_entry_pc = 0;
++static uint32_t once_count_orig_insn = 0x88dffc02; /* ldar w2, [x0] */
++static uint32_t once_count_brk_insn = 0xd4200000;  /* brk #0 */
++static _Atomic bool once_count_armed = false;
++static _Atomic uint64_t once_count_target_hits = 0;
++static _Atomic uint64_t once_count_total_hits = 0;
++
++void once_count_exec_reset(void)
++{
++    atomic_store_explicit(&once_count_armed, false, memory_order_release);
++    once_count_libc_base = 0;
++    once_count_entry_pc = 0;
++}
++
++/* Hook called from vcpu_handle_brk in proc.c */
++bool once_count_handle_brk(guest_t *g, hv_vcpu_t vcpu, uint64_t brk_pc)
++{
++    if (!atomic_load_explicit(&once_count_armed, memory_order_relaxed)) {
++        return false;
++    }
++    if (once_count_entry_pc == 0 || brk_pc != once_count_entry_pc) {
++        return false;
++    }
++
++    /* Target entry hit! */
++    uint64_t x0 = 0;
++    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
++
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    uint64_t us = (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
++
++    uint32_t word = 0;
++    int word_status = guest_read_small(g, x0, &word, sizeof(word));
++
++    /* Track active once control word for current thread */
++    extern void once_track_enter(uint64_t uaddr, uint32_t word);
++    once_track_enter(x0, word);
++
++    uint64_t total = atomic_fetch_add_explicit(&once_count_total_hits, 1, memory_order_relaxed) + 1;
++    bool is_target = (x0 == once_count_target_uaddr);
++    uint64_t target_count = 0;
++    if (is_target) {
++        target_count = atomic_fetch_add_explicit(&once_count_target_hits, 1, memory_order_relaxed) + 1;
++    }
++
++    uint64_t lr = 0;
++    hv_vcpu_get_reg(vcpu, HV_REG_LR, &lr);
++
++    char line[512];
++    int n = snprintf(line, sizeof(line),
++        "ONCE_ENTRY_COUNT ts_us=%llu pid=%ld gtid=%lld pc=0x%llx x0_uaddr=0x%llx is_target=%d target_count=%llu total_count=%llu word=%u word_status=%d lr=0x%llx%c",
++        (unsigned long long)us, (long)getpid(), (current_thread ? (long long)current_thread->guest_tid : 1LL),
++        (unsigned long long)brk_pc, (unsigned long long)x0,
++        is_target ? 1 : 0, (unsigned long long)target_count, (unsigned long long)total,
++        word, word_status, (unsigned long long)lr, 10);
++    if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++
++    /* Bounded guest call stack walk on x29 frame pointer chain (Task-96)
++     * Selective capture: only execute for target address (e.g. 0x20102d440) to minimize overhead.
++     */
++    if (is_target) {
++        uint64_t fp = 0;
++        hv_vcpu_get_reg(vcpu, HV_REG_FP, &fp); /* AArch64 X29 */
++
++        struct timespec t_bt_start;
++        clock_gettime(CLOCK_MONOTONIC, &t_bt_start);
++
++        /* Frame 0: immediate caller from X30 (LR) */
++        char mod[MAXPATHLEN];
++        uint64_t off = 0;
++        resolve_addr_module(g, lr, mod, sizeof(mod), &off);
++        char frame_line[512];
++        int flen = snprintf(frame_line, sizeof(frame_line),
++            "ONCE_BACKTRACE_FRAME pid=%ld gtid=%lld target_count=%llu depth=0 fp=0x%llx pc=0x%llx mod=%s off=0x%llx%c",
++            (long)getpid(), (current_thread ? (long long)current_thread->guest_tid : 1LL),
++            (unsigned long long)target_count, (unsigned long long)fp,
++            (unsigned long long)lr, mod, (unsigned long long)off, 10);
++        if (flen > 0 && (size_t)flen < sizeof(frame_line)) (void)write(STDERR_FILENO, frame_line, (size_t)flen);
++
++        /* Walk up to 16 frames along X29 chain */
++        #define MAX_BT_FRAMES 32
++        uint64_t visited_fps[MAX_BT_FRAMES];
++        visited_fps[0] = fp;
++        int depth = 1;
++
++        uint64_t cur_fp = fp;
++        while (depth < MAX_BT_FRAMES) {
++            /* Validity checks for cur_fp */
++            if (cur_fp == 0 || (cur_fp & 7) != 0 || cur_fp < 0x1000) {
++                break;
++            }
++
++            /* Read AArch64 standard frame record: [FP] = next_fp, [FP + 8] = return_pc */
++            uint64_t frame_rec[2] = {0, 0};
++            if (guest_read_small(g, cur_fp, frame_rec, sizeof(frame_rec)) != 0) {
++                char err_line[256];
++                int elen = snprintf(err_line, sizeof(err_line),
++                    "ONCE_BACKTRACE_FRAME pid=%ld gtid=%lld target_count=%llu depth=%d fp=0x%llx pc=0x0 mod=[unknown] off=0x0 unresolvable=read_fault%c",
++                    (long)getpid(), (current_thread ? (long long)current_thread->guest_tid : 1LL),
++                    (unsigned long long)target_count, depth, (unsigned long long)cur_fp, 10);
++                if (elen > 0 && (size_t)elen < sizeof(err_line)) (void)write(STDERR_FILENO, err_line, (size_t)elen);
++                break;
++            }
++
++            uint64_t next_fp = frame_rec[0];
++            uint64_t ret_pc = frame_rec[1];
++
++            if (ret_pc == 0) {
++                break;
++            }
++
++            resolve_addr_module(g, ret_pc, mod, sizeof(mod), &off);
++            flen = snprintf(frame_line, sizeof(frame_line),
++                "ONCE_BACKTRACE_FRAME pid=%ld gtid=%lld target_count=%llu depth=%d fp=0x%llx pc=0x%llx mod=%s off=0x%llx%c",
++                (long)getpid(), (current_thread ? (long long)current_thread->guest_tid : 1LL),
++                (unsigned long long)target_count, depth, (unsigned long long)cur_fp,
++                (unsigned long long)ret_pc, mod, (unsigned long long)off, 10);
++            if (flen > 0 && (size_t)flen < sizeof(frame_line)) (void)write(STDERR_FILENO, frame_line, (size_t)flen);
++
++            /* Cycle detection */
++            bool cycle = false;
++            for (int v = 0; v < depth; v++) {
++                if (visited_fps[v] == next_fp) {
++                    cycle = true;
++                    break;
++                }
++            }
++            if (cycle) {
++                char err_line[256];
++                int elen = snprintf(err_line, sizeof(err_line),
++                    "ONCE_BACKTRACE_FRAME pid=%ld gtid=%lld target_count=%llu depth=%d fp=0x%llx pc=0x0 mod=[unknown] off=0x0 unresolvable=cycle_detected%c",
++                    (long)getpid(), (current_thread ? (long long)current_thread->guest_tid : 1LL),
++                    (unsigned long long)target_count, depth + 1, (unsigned long long)next_fp, 10);
++                if (elen > 0 && (size_t)elen < sizeof(err_line)) (void)write(STDERR_FILENO, err_line, (size_t)elen);
++                break;
++            }
++
++            visited_fps[depth] = next_fp;
++            cur_fp = next_fp;
++            depth++;
++        }
++
++        struct timespec t_bt_end;
++        clock_gettime(CLOCK_MONOTONIC, &t_bt_end);
++        uint64_t bt_elapsed_us = (uint64_t)(t_bt_end.tv_sec - t_bt_start.tv_sec) * 1000000ULL +
++                                 (t_bt_end.tv_nsec - t_bt_start.tv_nsec) / 1000;
++        char summary_line[256];
++        int slen = snprintf(summary_line, sizeof(summary_line),
++            "ONCE_BACKTRACE_SUMMARY pid=%ld gtid=%lld target_count=%llu total_frames=%d elapsed_us=%llu%c",
++            (long)getpid(), (current_thread ? (long long)current_thread->guest_tid : 1LL),
++            (unsigned long long)target_count, depth, (unsigned long long)bt_elapsed_us, 10);
++        if (slen > 0 && (size_t)slen < sizeof(summary_line)) (void)write(STDERR_FILENO, summary_line, (size_t)slen);
++    }
++
++    /* Emulate the original instruction: ldar w2, [x0]
++     * In AArch64:
++     * - Load 32-bit word from guest address [X0] with acquire semantics into W2;
++     * - Advance PC past the 4-byte instruction (PC = brk_pc + 4);
++     * - Resume guest execution directly without delivering SIGTRAP.
++     */
++    uint32_t val32 = 0;
++    if (guest_read_small(g, x0, &val32, sizeof(val32)) == 0) {
++        hv_vcpu_set_reg(vcpu, HV_REG_X2, (uint64_t)val32);
++    }
++    /* Do NOT change HV_REG_PC! The vCPU is currently in EL1 inside the shim.
++     * The shim handle_brk will execute eret, returning to EL0 at ELR_EL1!
++     */
++    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, brk_pc + 4);
++
++    return true; /* Handled, do not deliver SIGTRAP */
++}
++
++static bool arm_once_entry_counter(guest_t *g)
++{
++    if (atomic_load_explicit(&once_count_armed, memory_order_relaxed)) {
++        return true;
++    }
++
++    const char *target_env = getenv("ELFUSE_ONCE_COUNT_UADDR");
++    if (target_env && target_env[0] != '\0') {
++        once_count_target_uaddr = strtoull(target_env, NULL, 0);
++    }
++
++    /* Locate libc.so.6 region */
++    const guest_region_t *r = NULL;
++    /* Search for libc region */
++    for (size_t i = 0; i < (size_t)g->nregions; i++) {
++        const guest_region_t *reg = &g->regions[i];
++        if (reg->name[0] != '\0' && strstr(reg->name, "libc.so") != NULL && (reg->prot & 4)) {
++            r = reg;
++            break;
++        }
++        if (reg->backing_fd >= 0) {
++            char mod[MAXPATHLEN];
++            if (fcntl(reg->backing_fd, F_GETPATH, mod) == 0 && strstr(mod, "libc.so") != NULL && (reg->prot & 4)) {
++                r = reg;
++                break;
++            }
++        }
++    }
++
++    if (!r) {
++        char err[128];
++        int en = snprintf(err, sizeof(err), "ONCE_COUNT_DEBUG: libc not found in %d regions%c", g->nregions, 10);
++        if (en > 0 && (size_t)en < sizeof(err)) (void)write(STDERR_FILENO, err, (size_t)en);
++        return false;
++    }
++
++    once_count_libc_base = r->start;
++    once_count_entry_pc = r->start + 0x8e1a0ULL;
++
++    /* Verify original instruction at entry_pc */
++    uint32_t cur_insn = 0;
++    if (guest_read_small(g, once_count_entry_pc, &cur_insn, sizeof(cur_insn)) != 0) {
++        char err[128];
++        int en = snprintf(err, sizeof(err), "ONCE_COUNT_DEBUG: guest_read_small failed at 0x%llx%c", (unsigned long long)once_count_entry_pc, 10);
++        if (en > 0 && (size_t)en < sizeof(err)) (void)write(STDERR_FILENO, err, (size_t)en);
++        return false;
++    }
++
++    if (cur_insn != once_count_orig_insn && cur_insn != once_count_brk_insn) {
++        char err[256];
++        int en = snprintf(err, sizeof(err), "ONCE_COUNT_WARN: entry insn mismatch at 0x%llx: expected 0x%x, got 0x%x%c",
++            (unsigned long long)once_count_entry_pc, once_count_orig_insn, cur_insn, 10);
++        if (en > 0 && (size_t)en < sizeof(err)) (void)write(STDERR_FILENO, err, (size_t)en);
++        /* Use whatever is there as original instruction if not brk */
++        if (cur_insn != once_count_brk_insn) once_count_orig_insn = cur_insn;
++    }
++
++    /* Write BRK #0 instruction into entry_pc via host pointer */
++    uint64_t avail = 0;
++    void *hptr = guest_ptr_bound(g, once_count_entry_pc, &avail, MEM_PERM_R, 4);
++    if (!hptr || avail < 4) {
++        char err[128];
++        int en = snprintf(err, sizeof(err), "ONCE_COUNT_DEBUG: guest_ptr_bound failed at 0x%llx%c", (unsigned long long)once_count_entry_pc, 10);
++        if (en > 0 && (size_t)en < sizeof(err)) (void)write(STDERR_FILENO, err, (size_t)en);
++        return false;
++    }
++    memcpy(hptr, &once_count_brk_insn, sizeof(once_count_brk_insn));
++
++    atomic_store_explicit(&once_count_armed, true, memory_order_release);
++
++    char line[512];
++    int n = snprintf(line, sizeof(line),
++        "ONCE_COUNT_ARMED pid=%ld libc_base=0x%llx entry_pc=0x%llx target_uaddr=0x%llx orig_insn=0x%x brk_insn=0x%x%c",
++        (long)getpid(), (unsigned long long)once_count_libc_base,
++        (unsigned long long)once_count_entry_pc, (unsigned long long)once_count_target_uaddr,
++        once_count_orig_insn, once_count_brk_insn, 10);
++    if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++
++    return true;
++}
++
++
+ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
+ {
+     uint64_t x0, x1, x2, x3, x4, x5, x8;
+@@ -2607,6 +3200,198 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
+      * instead, which holds it valid against a CLONE_THREAD sibling's close.
+      */
+     int nr = (int) x8;
++    extern bool io_fixture_identity_active(void);
++    static _Thread_local unsigned transaction_sequence;
++    unsigned transaction_id = 0;
++    struct timespec transaction_start = {0};
++
++    bool is_lifecycle_sc = (nr == SYS_clone || nr == SYS_clone3 ||
++                           nr == SYS_exit || nr == SYS_exit_group ||
++                           nr == SYS_set_tid_address || nr == SYS_futex);
++    if (nr == SYS_exit || nr == SYS_exit_group) {
++        atomic_store_explicit(&once_trace_stop_sampler, true, memory_order_release);
++    }
++
++    bool lifetime_observe = getenv("ELFUSE_THREAD_LIFETIME_OBSERVE") != NULL;
++    if (lifetime_observe) {
++        pthread_once(&thread_watchdog_once, thread_watchdog_init_fn);
++    }
++
++    bool once_trace_observe = (getenv("ELFUSE_ONCE_TRACE_OBSERVE") != NULL) ||
++                             (getenv("ELFUSE_ONCE_COUNT_OBSERVE") != NULL) ||
++                             (getenv("ELFUSE_ONCE_PANORAMA_OBSERVE") != NULL);
++    if (once_trace_observe) {
++        once_trace_guest_ptr = g;
++        pthread_once(&once_sampler_thread_once, once_sampler_init_fn);
++
++        if (current_thread && current_thread->guest_tid == 1) {
++            uint64_t cur_lr = 0, cur_elr = 0;
++            hv_vcpu_get_reg(vcpu, HV_REG_LR, &cur_lr);
++            hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &cur_elr);
++            atomic_store_explicit(&last_main_elr, cur_elr, memory_order_relaxed);
++            atomic_store_explicit(&last_main_lr, cur_lr, memory_order_relaxed);
++
++            const char *target_env = getenv("ELFUSE_ONCE_COUNT_UADDR");
++            if (!target_env || target_env[0] == '\0') {
++                target_env = getenv("ELFUSE_ONCE_TRACE_UADDR");
++            }
++            uint64_t target_uaddr = target_env ? strtoull(target_env, NULL, 0) : 0;
++
++            if (target_uaddr != 0) {
++                const guest_region_t *r = guest_region_find(g, target_uaddr);
++                if (r != NULL && r->start >= 0x200000000ULL) {
++                    if (!atomic_load_explicit(&once_count_armed, memory_order_relaxed)) {
++                        arm_once_entry_counter(g);
++                    }
++                }
++            } else {
++                /* Linux path or no target: arm as soon as libc.so is mapped */
++                if (!atomic_load_explicit(&once_count_armed, memory_order_relaxed)) {
++                    arm_once_entry_counter(g);
++                }
++            }
++        }
++    }
++    bool log_lifetime = lifetime_observe && is_lifecycle_sc;
++    struct timespec lifetime_start = {0};
++    uint64_t lt_args[6] = {0};
++    uint64_t lt_lr = 0, lt_elr = 0;
++
++    if (log_lifetime) {
++        int saved_errno = errno;
++        clock_gettime(CLOCK_MONOTONIC, &lifetime_start);
++        uint64_t now_us = (uint64_t)lifetime_start.tv_sec * 1000000ULL + lifetime_start.tv_nsec / 1000;
++
++        hv_vcpu_get_reg(vcpu, HV_REG_X0, &lt_args[0]);
++        hv_vcpu_get_reg(vcpu, HV_REG_X1, &lt_args[1]);
++        hv_vcpu_get_reg(vcpu, HV_REG_X2, &lt_args[2]);
++        hv_vcpu_get_reg(vcpu, HV_REG_X3, &lt_args[3]);
++        hv_vcpu_get_reg(vcpu, HV_REG_X4, &lt_args[4]);
++        hv_vcpu_get_reg(vcpu, HV_REG_X5, &lt_args[5]);
++        hv_vcpu_get_reg(vcpu, HV_REG_LR, &lt_lr);
++        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &lt_elr);
++
++        const char *sc_name = "unknown";
++        switch (nr) {
++        case SYS_clone: sc_name = "clone"; break;
++        case SYS_clone3: sc_name = "clone3"; break;
++        case SYS_exit: sc_name = "exit"; break;
++        case SYS_exit_group: sc_name = "exit_group"; break;
++        case SYS_set_tid_address: sc_name = "set_tid_address"; break;
++        case SYS_futex: sc_name = "futex"; break;
++        }
++
++        char enter_msg[512];
++        int emn = snprintf(enter_msg, sizeof(enter_msg),
++            "THREAD_LIFETIME_ENTER ts_us=%llu pid=%ld gtid=%lld nr=%d sc=%s x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx x4=0x%llx x5=0x%llx lr=0x%llx elr=0x%llx%c",
++            (unsigned long long)now_us, (long)getpid(), current_thread ? (long long)current_thread->guest_tid : -1LL,
++            nr, sc_name,
++            (unsigned long long)lt_args[0], (unsigned long long)lt_args[1], (unsigned long long)lt_args[2],
++            (unsigned long long)lt_args[3], (unsigned long long)lt_args[4], (unsigned long long)lt_args[5],
++            (unsigned long long)lt_lr, (unsigned long long)lt_elr, 10);
++        if (emn > 0 && (size_t)emn < sizeof(enter_msg)) (void)write(STDERR_FILENO, enter_msg, (size_t)emn);
++
++        if (nr == SYS_futex) {
++            uint32_t word = 0;
++            int word_status = guest_read_small(g, lt_args[0], &word, sizeof(word));
++            char f_msg[256];
++            int fn = snprintf(f_msg, sizeof(f_msg),
++                "THREAD_FUTEX_DETAIL ts_us=%llu pid=%ld gtid=%lld uaddr=0x%llx op=0x%llx val=%llu word=%u word_status=%d%c",
++                (unsigned long long)now_us, (long)getpid(), current_thread ? (long long)current_thread->guest_tid : -1LL,
++                (unsigned long long)lt_args[0], (unsigned long long)lt_args[1], (unsigned long long)lt_args[2],
++                word, word_status, 10);
++            if (fn > 0 && (size_t)fn < sizeof(f_msg)) (void)write(STDERR_FILENO, f_msg, (size_t)fn);
++
++            dump_thread_table_snapshot("futex_call");
++        }
++        errno = saved_errno;
++    }
++
++    bool futex_owner_observe = (nr == SYS_futex) && (getenv("ELFUSE_FUTEX_OWNER_OBSERVE") != NULL);
++    bool futex_owner_matched = false;
++    uint64_t fo_uaddr = 0, fo_op = 0, fo_val = 0, fo_timeout = 0, fo_uaddr2 = 0, fo_val3 = 0, fo_lr = 0, fo_elr = 0;
++    struct timespec futex_owner_start = {0};
++
++    if (futex_owner_observe) {
++        int saved_errno = errno;
++        hv_vcpu_get_reg(vcpu, HV_REG_X0, &fo_uaddr);
++        hv_vcpu_get_reg(vcpu, HV_REG_X1, &fo_op);
++        hv_vcpu_get_reg(vcpu, HV_REG_X2, &fo_val);
++        hv_vcpu_get_reg(vcpu, HV_REG_X3, &fo_timeout);
++        hv_vcpu_get_reg(vcpu, HV_REG_X4, &fo_uaddr2);
++        hv_vcpu_get_reg(vcpu, HV_REG_X5, &fo_val3);
++        hv_vcpu_get_reg(vcpu, HV_REG_LR, &fo_lr);
++        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &fo_elr);
++
++        const char *target_env = getenv("ELFUSE_FUTEX_TARGET_UADDR");
++        uint64_t target_uaddr = target_env ? strtoull(target_env, NULL, 0) : 0;
++        if (target_uaddr == 0 || fo_uaddr == target_uaddr) {
++            futex_owner_matched = true;
++            clock_gettime(CLOCK_MONOTONIC, &futex_owner_start);
++
++            uint32_t word = 0;
++            int word_status = guest_read_small(g, fo_uaddr, &word, sizeof(word));
++
++            char enter_line[512];
++            int n = snprintf(enter_line, sizeof(enter_line),
++                "FUTEX_OWNER_ENTER pid=%ld gtid=%lld uaddr=0x%llx op=0x%llx val=%llu timeout=0x%llx uaddr2=0x%llx val3=%llu word=%u word_status=%d lr=0x%llx elr=0x%llx%c",
++                (long)getpid(), current_thread ? (long long)current_thread->guest_tid : -1LL,
++                (unsigned long long)fo_uaddr, (unsigned long long)fo_op, (unsigned long long)fo_val,
++                (unsigned long long)fo_timeout, (unsigned long long)fo_uaddr2, (unsigned long long)fo_val3,
++                word, word_status, (unsigned long long)fo_lr, (unsigned long long)fo_elr, 10);
++            if (n > 0 && (size_t)n < sizeof(enter_line)) (void)write(STDERR_FILENO, enter_line, (size_t)n);
++
++            /* 1. Module attribution for uaddr, elr, lr */
++            futex_owner_log_mapping(g, "uaddr", fo_uaddr);
++            futex_owner_log_mapping(g, "elr", fo_elr);
++            futex_owner_log_mapping(g, "lr", fo_lr);
++
++            /* 2. Process-wide thread state dump */
++            struct futex_owner_dump_ctx ctx = { getpid(), current_thread ? current_thread->guest_tid : -1LL, fo_uaddr };
++            thread_for_each(futex_owner_thread_cb, &ctx);
++        }
++        errno = saved_errno;
++    }
++
++    bool transaction_observe = getenv("ELFUSE_IO_TRANSACTION_OBSERVE") &&
++        io_fixture_identity_active() && transaction_sequence < 4096;
++    if (transaction_observe) {
++        int saved_errno = errno;
++        uint64_t fdarg = 0, sizearg = 0;
++        hv_return_t fd_status = hv_vcpu_get_reg(vcpu, HV_REG_X0, &fdarg);
++        hv_return_t size_status = hv_vcpu_get_reg(vcpu, HV_REG_X2, &sizearg);
++        if (nr == SYS_futex) {
++            int fsaved = errno;
++            uint64_t op=0, timeout=0, uaddr2=0, val3=0, lr=0, elr=0;
++            int op_status=(int)hv_vcpu_get_reg(vcpu, HV_REG_X1, &op);
++            int timeout_status=(int)hv_vcpu_get_reg(vcpu, HV_REG_X3, &timeout);
++            int uaddr2_status=(int)hv_vcpu_get_reg(vcpu, HV_REG_X4, &uaddr2);
++            int val3_status=(int)hv_vcpu_get_reg(vcpu, HV_REG_X5, &val3);
++            int lr_status=(int)hv_vcpu_get_reg(vcpu, HV_REG_LR, &lr);
++            int elr_status=(int)hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
++            uint32_t word=0;
++            int word_status=guest_read_small(g, fdarg, &word, sizeof(word));
++            char metadata[512];
++            int mn=snprintf(metadata,sizeof(metadata),
++                "FUTEX_ARGS pid=%ld gtid=%lld id=%u uaddr=0x%llx op=0x%llx val=%llu timeout=0x%llx uaddr2=0x%llx val3=%llu word=%u word_status=%d op_status=%d timeout_status=%d uaddr2_status=%d val3_status=%d lr=0x%llx elr=0x%llx lr_status=%d elr_status=%d%c",
++                (long)getpid(), current_thread ? (long long)current_thread->guest_tid : -1LL,
++                transaction_sequence,(unsigned long long)fdarg,(unsigned long long)op,(unsigned long long)sizearg,
++                (unsigned long long)timeout,(unsigned long long)uaddr2,(unsigned long long)val3,word,word_status,
++                op_status,timeout_status,uaddr2_status,val3_status,(unsigned long long)lr,(unsigned long long)elr,lr_status,elr_status,10);
++            if(mn>0 && (size_t)mn<sizeof(metadata)) (void)write(STDERR_FILENO,metadata,(size_t)mn);
++            errno=fsaved;
++        }
++        transaction_id = transaction_sequence++;
++        clock_gettime(CLOCK_MONOTONIC, &transaction_start);
++        char line[256];
++        int n = snprintf(line, sizeof(line),
++            "IO_TX_ENTER pid=%ld gtid=%lld id=%u nr=%d fd=%lld arg2=%llu fd_status=0x%x arg2_status=0x%x%c",
++            (long)getpid(), current_thread ? (long long)current_thread->guest_tid : -1LL,
++            transaction_id, nr, (long long)fdarg, (unsigned long long)sizearg,
++            (unsigned)fd_status, (unsigned)size_status, 10);
++        if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++        errno = saved_errno;
++    }
+     const syscall_entry_t *entry = NULL;
+ 
+     /* Where this thread is, for the execve teardown to report when a sibling
+@@ -2642,6 +3427,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
+             hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
+             hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
+             int fd = (int) x0;
++            if (nr == SYS_write && getenv("ELFUSE_FIXTURE_IDENTITY"))
++                goto slow_path;
+             if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
+                 goto slow_path;
+ 
+@@ -2844,6 +3631,68 @@ slow_path:
+ 
+ 
+ fast_done:
++    if (once_trace_observe && is_lifecycle_sc && current_thread && current_thread->guest_tid == 1) {
++        uint64_t cur_lr = 0, cur_elr = 0;
++        hv_vcpu_get_reg(vcpu, HV_REG_LR, &cur_lr);
++        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &cur_elr);
++        check_and_log_once_transition(g, "lifecycle_sc_return", cur_elr, cur_lr);
++    }
++    if (log_lifetime) {
++        int saved_errno = errno;
++        struct timespec now;
++        clock_gettime(CLOCK_MONOTONIC, &now);
++        uint64_t ret_us = (uint64_t)now.tv_sec * 1000000ULL + now.tv_nsec / 1000;
++        int64_t elapsed_us = (int64_t)(now.tv_sec - lifetime_start.tv_sec) * 1000000LL + (now.tv_nsec - lifetime_start.tv_nsec) / 1000;
++
++        const char *sc_ret_name = "unknown";
++        switch (nr) {
++        case SYS_clone: sc_ret_name = "clone"; break;
++        case SYS_clone3: sc_ret_name = "clone3"; break;
++        case SYS_exit: sc_ret_name = "exit"; break;
++        case SYS_exit_group: sc_ret_name = "exit_group"; break;
++        case SYS_set_tid_address: sc_ret_name = "set_tid_address"; break;
++        case SYS_futex: sc_ret_name = "futex"; break;
++        }
++
++        char ret_msg[256];
++        int rmn = snprintf(ret_msg, sizeof(ret_msg),
++            "THREAD_LIFETIME_RETURN ts_us=%llu pid=%ld gtid=%lld nr=%d sc=%s result=%lld elapsed_us=%lld%c",
++            (unsigned long long)ret_us, (long)getpid(), current_thread ? (long long)current_thread->guest_tid : -1LL,
++            nr, sc_ret_name, (long long)result, (long long)elapsed_us, 10);
++        if (rmn > 0 && (size_t)rmn < sizeof(ret_msg)) (void)write(STDERR_FILENO, ret_msg, (size_t)rmn);
++
++        if (nr == SYS_clone || nr == SYS_clone3) {
++            dump_thread_table_snapshot("clone_return");
++        }
++        errno = saved_errno;
++    }
++    if (futex_owner_matched) {
++        int saved_errno = errno;
++        struct timespec now;
++        clock_gettime(CLOCK_MONOTONIC, &now);
++        int64_t ns = (int64_t)(now.tv_sec - futex_owner_start.tv_sec)*1000000000LL + now.tv_nsec - futex_owner_start.tv_nsec;
++        char ret_line[256];
++        int rn = snprintf(ret_line, sizeof(ret_line),
++            "FUTEX_OWNER_RETURN pid=%ld gtid=%lld uaddr=0x%llx op=0x%llx result=%lld elapsed_us=%lld%c",
++            (long)getpid(), current_thread ? (long long)current_thread->guest_tid : -1LL,
++            (unsigned long long)fo_uaddr, (unsigned long long)fo_op,
++            (long long)result, (long long)(ns / 1000), 10);
++        if (rn > 0 && (size_t)rn < sizeof(ret_line)) (void)write(STDERR_FILENO, ret_line, (size_t)rn);
++        errno = saved_errno;
++    }
++    if (transaction_observe) {
++        int saved_errno = errno;
++        struct timespec now;
++        clock_gettime(CLOCK_MONOTONIC, &now);
++        int64_t ns = (int64_t)(now.tv_sec - transaction_start.tv_sec)*1000000000LL + now.tv_nsec - transaction_start.tv_nsec;
++        char line[224];
++        int n = snprintf(line, sizeof(line),
++            "IO_TX_RETURN pid=%ld gtid=%lld id=%u nr=%d result=%lld elapsed_us=%lld%c",
++            (long)getpid(), current_thread ? (long long)current_thread->guest_tid : -1LL,
++            transaction_id, nr, (long long)result, (long long)(ns/1000), 10);
++        if (n > 0 && (size_t)n < sizeof(line)) (void)write(STDERR_FILENO, line, (size_t)n);
++        errno = saved_errno;
++    }
+     thread_note_syscall(-1);
+ 
+     if (!should_exit) {
+diff --git a/tests/run_verification.sh b/tests/run_verification.sh
+new file mode 100755
+index 0000000..4d0aa6d
+--- /dev/null
++++ b/tests/run_verification.sh
+@@ -0,0 +1,62 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
++DERIVED_ELFUSE="$REPO_ROOT/sources/elfuse-derived/build/elfuse"
++ORIG_ELFUSE="$REPO_ROOT/sources/elfuse/build/elfuse"
++SYSROOT="$REPO_ROOT/fixtures/runtime/sysroot"
++LOG="$REPO_ROOT/logs/abi-fix/verification_round3.log"
++
++mkdir -p "$(dirname "$LOG")"
++
++echo "=== ELFUSE ABI FIX VERIFICATION ROUND 3 ===" | tee "$LOG"
++date -u +"Date: %Y-%m-%d %H:%M:%S UTC" | tee -a "$LOG"
++echo "Derived binary: $DERIVED_ELFUSE" | tee -a "$LOG"
++
++# 1. Verify Red State on original binary
++echo "--- 1. Original Binary Red Reproduction ---" | tee -a "$LOG"
++"$ORIG_ELFUSE" --timeout 5 "$REPO_ROOT/fixtures/abi/bin/futex" > /tmp/orig_futex.out 2>&1 || true
++head -n 5 /tmp/orig_futex.out | tee -a "$LOG"
++if grep -q "FUTEX_TIMEOUT_DESPITE_SHARED_WRITE" /tmp/orig_futex.out; then
++    echo "Confirmed: Original binary fails with FUTEX_TIMEOUT_DESPITE_SHARED_WRITE" | tee -a "$LOG"
++fi
++rm -f /tmp/orig_futex.out
++
++# 2. Verify Green State on derived binary
++echo "--- 2. Derived Binary Green Verification (fixtures/abi/bin/futex) ---" | tee -a "$LOG"
++"$DERIVED_ELFUSE" --timeout 5 "$REPO_ROOT/fixtures/abi/bin/futex" 2>&1 | tee -a "$LOG"
++rc=$?
++echo "Exit Code: $rc" | tee -a "$LOG"
++
++# 3. Comprehensive Futex ABI Suite (12 edge cases & rigorous error mapping)
++echo "--- 3. Comprehensive Futex ABI Suite (test_futex_abi_suite) ---" | tee -a "$LOG"
++"$DERIVED_ELFUSE" --timeout 5 "$REPO_ROOT/sources/elfuse-derived/tests/test_futex_abi_suite" 2>&1 | tee -a "$LOG"
++rc=$?
++echo "Exit Code: $rc" | tee -a "$LOG"
++
++# 4. Shared memory fixture
++echo "--- 4. Shared memory fixture (fixtures/abi/bin/shared) ---" | tee -a "$LOG"
++"$DERIVED_ELFUSE" --timeout 5 "$REPO_ROOT/fixtures/abi/bin/shared" 2>&1 | tee -a "$LOG"
++echo "Exit Code: $?" | tee -a "$LOG"
++
++# 5. Signal fixture
++echo "--- 5. Signal fixture (fixtures/abi/bin/signal) ---" | tee -a "$LOG"
++"$DERIVED_ELFUSE" --timeout 5 "$REPO_ROOT/fixtures/abi/bin/signal" 2>&1 | tee -a "$LOG"
++echo "Exit Code: $?" | tee -a "$LOG"
++
++# 6. Dynamic glibc hello
++echo "--- 6. Dynamic glibc hello (fixtures/abi/bin/dynamic_hello) ---" | tee -a "$LOG"
++"$DERIVED_ELFUSE" --timeout 5 --sysroot "$SYSROOT" "$REPO_ROOT/fixtures/abi/bin/dynamic_hello" 2>&1 | tee -a "$LOG"
++echo "Exit Code: $?" | tee -a "$LOG"
++
++# 7. Priority 2 check: spawn_missing
++echo "--- 7. Priority 2 check: spawn_missing (architectural vfork limitation) ---" | tee -a "$LOG"
++"$DERIVED_ELFUSE" --timeout 5 --sysroot "$SYSROOT" "$REPO_ROOT/fixtures/abi/bin/spawn_missing" 2>&1 | tee -a "$LOG"
++echo "Exit Code: $?" | tee -a "$LOG"
++
++# 8. Baseline regression check (7 baseline tests)
++echo "--- 8. Baseline regression check (7 baseline tests) ---" | tee -a "$LOG"
++ELFUSE_BIN="$DERIVED_ELFUSE" "$REPO_ROOT/scripts/elfuse/run_all_baseline.sh" 2>&1 | tee -a "$LOG"
++echo "Baseline suite Exit Code: $?" | tee -a "$LOG"
++
++echo "=== ALL VERIFICATIONS COMPLETED ===" | tee -a "$LOG"
+diff --git a/tests/test-preempt-lifecycle-host.c b/tests/test-preempt-lifecycle-host.c
+new file mode 100644
+index 0000000..54075fe
+--- /dev/null
++++ b/tests/test-preempt-lifecycle-host.c
+@@ -0,0 +1,143 @@
++/*
++ * Unit test: proc_preempt_stop production lifecycle and happens-before join
++ *
++ * Copyright 2026 elfuse contributors
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Directly exercises the real production proc_preempt_init() and
++ * proc_preempt_stop() implementations in src/syscall/proc.c.
++ */
++
++#include <assert.h>
++#include <errno.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include "syscall/proc.h"
++#include "core/guest.h"
++
++static int fails;
++#define CHECK(cond)                                                          \
++    do {                                                                     \
++        if (!(cond)) {                                                       \
++            printf("  FAIL %s:%d: %s\n", __func__, __LINE__, #cond);         \
++            fails++;                                                         \
++        }                                                                    \
++    } while (0)
++
++/* Test 1: Real production start and clean stop */
++static void test_real_start_stop(void)
++{
++    printf("  [TEST 1] real production proc_preempt_init and proc_preempt_stop...\n");
++    int rc = proc_preempt_init();
++    CHECK(rc == 0);
++
++    /* Real production stop must return 0 */
++    int s = proc_preempt_stop();
++    CHECK(s == 0);
++}
++
++/* Test 2: Real production stop idempotency */
++static void test_real_stop_idempotent(void)
++{
++    printf("  [TEST 2] real production stop idempotency...\n");
++    /* Calling stop again on already stopped thread must return 0 without error */
++    int s1 = proc_preempt_stop();
++    CHECK(s1 == 0);
++    int s2 = proc_preempt_stop();
++    CHECK(s2 == 0);
++}
++
++/* Test 3: Multiple real production init-stop cycles */
++static void test_real_reinit_cycles(void)
++{
++    printf("  [TEST 3] 5 real production init-stop cycles...\n");
++    for (int i = 0; i < 5; i++) {
++        int rc = proc_preempt_init();
++        CHECK(rc == 0);
++        int s = proc_preempt_stop();
++        CHECK(s == 0);
++    }
++}
++
++/* Test 4: Signal delivered to process then stopped */
++static void test_real_signal_then_stop(void)
++{
++    printf("  [TEST 4] signal delivery to real preemption thread then stop...\n");
++    int rc = proc_preempt_init();
++    CHECK(rc == 0);
++
++    /* Send SIGALRM to self; the real preemption thread catches it via sigwait */
++    kill(getpid(), SIGALRM);
++    usleep(10000); /* 10ms for thread to process */
++
++    int s = proc_preempt_stop();
++    CHECK(s == 0);
++}
++
++/* Test 5: Fork child state reset through real pthread_atfork */
++static void test_real_fork_child_state(void)
++{
++    printf("  [TEST 5] fork child state reset with real pthread_atfork...\n");
++    int rc = proc_preempt_init();
++    CHECK(rc == 0);
++
++    pid_t pid = fork();
++    CHECK(pid >= 0);
++    if (pid == 0) {
++        /* In child: real pthread_atfork must have reset g_preempt_started to false */
++        /* Calling stop in child must be safe no-op returning 0 */
++        int s_child = proc_preempt_stop();
++        if (s_child != 0) {
++            _exit(1);
++        }
++        /* Re-init in child must start fresh thread */
++        int init_child = proc_preempt_init();
++        if (init_child != 0) {
++            _exit(2);
++        }
++        int s_child2 = proc_preempt_stop();
++        if (s_child2 != 0) {
++            _exit(3);
++        }
++        _exit(0);
++    }
++
++    int status = 0;
++    waitpid(pid, &status, 0);
++    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
++
++    int s = proc_preempt_stop();
++    CHECK(s == 0);
++}
++
++/* Test 6: Verify guest_teardown_failed flag behavior */
++static void test_teardown_failed_flag(void)
++{
++    printf("  [TEST 6] guest_teardown_failed flag and recovery...\n");
++    guest_teardown_clear_failure();
++    CHECK(!guest_teardown_failed());
++}
++
++int main(void)
++{
++    printf("test-preempt-lifecycle-host: testing REAL production proc_preempt functions\n");
++    test_real_start_stop();
++    test_real_stop_idempotent();
++    test_real_reinit_cycles();
++    test_real_signal_then_stop();
++    test_real_fork_child_state();
++    test_teardown_failed_flag();
++
++    if (fails == 0) {
++        printf("  ALL REAL PRODUCTION PREEMPT LIFECYCLE CHECKS PASSED\n");
++        return 0;
++    }
++    return 1;
++}
+diff --git a/tests/test_futex_abi_suite.c b/tests/test_futex_abi_suite.c
+new file mode 100644
+index 0000000..4e1c0f3
+--- /dev/null
++++ b/tests/test_futex_abi_suite.c
+@@ -0,0 +1,300 @@
++typedef unsigned int uint32_t;
++typedef unsigned long uint64_t;
++
++#define FUTEX_WAIT 0
++#define FUTEX_WAKE 1
++#define FUTEX_WAIT_BITSET 9
++#define FUTEX_WAKE_BITSET 10
++#define FUTEX_PRIVATE_FLAG 128
++#define FUTEX_WAIT_PRIVATE (FUTEX_WAIT | FUTEX_PRIVATE_FLAG)
++#define FUTEX_WAKE_PRIVATE (FUTEX_WAKE | FUTEX_PRIVATE_FLAG)
++
++#define WNOHANG 1
++
++static inline long sc(long n, long a, long b, long c, long d, long e, long f) {
++    register long x8 __asm__("x8") = n;
++    register long x0 __asm__("x0") = a;
++    register long x1 __asm__("x1") = b;
++    register long x2 __asm__("x2") = c;
++    register long x3 __asm__("x3") = d;
++    register long x4 __asm__("x4") = e;
++    register long x5 __asm__("x5") = f;
++    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5) : "memory");
++    return x0;
++}
++
++static inline void print_str(const char *s) {
++    long len = 0;
++    while (s[len]) len++;
++    sc(64, 1, (long)s, len, 0, 0, 0);
++}
++
++struct ts {
++    long tv_sec;
++    long tv_nsec;
++};
++
++void _start(void) {
++    print_str("--- FUTEX ABI TEST SUITE ---\n");
++
++    // Allocate shared page
++    volatile uint32_t *p = (void *)sc(222, 0, 16384, 3, 0x21, -1, 0); // mmap MAP_SHARED|MAP_ANONYMOUS
++    if ((long)p < 0 && (long)p > -4096) {
++        print_str("FAIL: mmap shared failed\n");
++        sc(93, 1, 0, 0, 0, 0, 0);
++    }
++    *p = 0;
++
++    // 1. Zero wake on zero waiters -> 0
++    long r1 = sc(98, (long)p, FUTEX_WAKE, 0, 0, 0, 0);
++    if (r1 != 0) {
++        print_str("FAIL: zero wake returned non-zero\n");
++        sc(93, 10, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 1 (zero wake -> 0)\n");
++
++    // 2. Wake with zero waiters -> 0
++    long r2 = sc(98, (long)p, FUTEX_WAKE, 1, 0, 0, 0);
++    if (r2 != 0) {
++        print_str("FAIL: wake 0 waiters returned non-zero\n");
++        sc(93, 11, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 2 (wake 0 waiters -> 0)\n");
++
++    // 3. Initial mismatch returns EAGAIN (-11)
++    *p = 42;
++    long r3 = sc(98, (long)p, FUTEX_WAIT, 999, 0, 0, 0); // expected 999, actual is 42
++    if (r3 != -11) {
++        print_str("FAIL: value mismatch did not return -EAGAIN\n");
++        sc(93, 12, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 3 (mismatch -> -EAGAIN)\n");
++
++    // 4. Timeout returns ETIMEDOUT (-110)
++    *p = 100;
++    struct ts short_to = {0, 30000000}; // 30ms
++    long r4 = sc(98, (long)p, FUTEX_WAIT, 100, (long)&short_to, 0, 0);
++    if (r4 != -110) {
++        print_str("FAIL: timeout did not return -ETIMEDOUT\n");
++        sc(93, 13, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 4 (timeout -> -ETIMEDOUT)\n");
++
++    // 5. Cross-process fork wait + wake
++    *p = 0;
++    long child = sc(220, 17, 0, 0, 0, 0, 0); // clone(SIGCHLD)
++    if (child < 0) {
++        print_str("FAIL: clone failed\n");
++        sc(93, 14, 0, 0, 0, 0, 0);
++    }
++    if (child == 0) {
++        // Child: delay 30ms, set *p = 1, call FUTEX_WAKE
++        struct ts d = {0, 30000000};
++        sc(101, (long)&d, 0, 0, 0, 0, 0); // nanosleep
++        *p = 1;
++        __asm__ volatile("dmb ish" ::: "memory");
++        long w = sc(98, (long)p, FUTEX_WAKE, 1, 0, 0, 0);
++        sc(93, w < 0 ? 99 : 0, 0, 0, 0, 0, 0); // exit(0)
++    }
++
++    // Parent waits with 1s limit
++    struct ts limit = {1, 0};
++    long w_res = sc(98, (long)p, FUTEX_WAIT, 0, (long)&limit, 0, 0);
++    int c_status = -1;
++    sc(260, child, (long)&c_status, 0, 0, 0, 0); // wait4
++
++    if (w_res != 0 && w_res != -11) {
++        print_str("FAIL: cross-process wait returned failure\n");
++        sc(93, 15, 0, 0, 0, 0, 0);
++    }
++    if (*p != 1) {
++        print_str("FAIL: *p was not 1 after wake\n");
++        sc(93, 16, 0, 0, 0, 0, 0);
++    }
++    if ((c_status >> 8) != 0) {
++        print_str("FAIL: child exited with error\n");
++        sc(93, 17, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 5 (cross-process fork wait+wake)\n");
++
++    // 6. Two waiters: wake 1 leaves exactly 1 blocked, second wake leaves 0
++    volatile uint32_t *p_two = (void *)sc(222, 0, 16384, 3, 0x21, -1, 0);
++    *p_two = 0;
++    long c1 = sc(220, 17, 0, 0, 0, 0, 0);
++    if (c1 == 0) {
++        // Child 1 waits on p_two
++        struct ts t = {2, 0};
++        sc(98, (long)p_two, FUTEX_WAIT, 0, (long)&t, 0, 0);
++        sc(93, 21, 0, 0, 0, 0, 0);
++    }
++    long c2 = sc(220, 17, 0, 0, 0, 0, 0);
++    if (c2 == 0) {
++        // Child 2 waits on p_two
++        struct ts t = {2, 0};
++        sc(98, (long)p_two, FUTEX_WAIT, 0, (long)&t, 0, 0);
++        sc(93, 22, 0, 0, 0, 0, 0);
++    }
++
++    // Give children time to park
++    struct ts park_d = {0, 50000000}; // 50ms
++    sc(101, (long)&park_d, 0, 0, 0, 0, 0);
++
++    // Wake 1 waiter
++    long woke_1 = sc(98, (long)p_two, FUTEX_WAKE, 1, 0, 0, 0);
++    if (woke_1 != 1) {
++        print_str("FAIL: wake 1 did not return 1\n");
++        sc(93, 18, 0, 0, 0, 0, 0);
++    }
++
++    // Wait 30ms to let the woken child exit
++    struct ts settle_d = {0, 30000000};
++    sc(101, (long)&settle_d, 0, 0, 0, 0, 0);
++
++    // Check with wait4(WNOHANG): exactly one child must have exited, the other still blocked
++    int st1 = -1, st2 = -1;
++    long r_c1 = sc(260, c1, (long)&st1, WNOHANG, 0, 0, 0);
++    long r_c2 = sc(260, c2, (long)&st2, WNOHANG, 0, 0, 0);
++
++    int dead_count = (r_c1 > 0 ? 1 : 0) + (r_c2 > 0 ? 1 : 0);
++    if (dead_count != 1) {
++        print_str("FAIL: wake 1 did not leave exactly 1 child running\n");
++        sc(93, 19, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 6a (wake 1 wakes exactly 1, leaves 1 blocked)\n");
++
++    // Now wake the remaining waiter
++    long woke_2 = sc(98, (long)p_two, FUTEX_WAKE, 1, 0, 0, 0);
++    if (woke_2 != 1) {
++        print_str("FAIL: wake remaining waiter did not return 1\n");
++        sc(93, 20, 0, 0, 0, 0, 0);
++    }
++
++    // Reap both
++    if (r_c1 == 0) sc(260, c1, (long)&st1, 0, 0, 0, 0);
++    if (r_c2 == 0) sc(260, c2, (long)&st2, 0, 0, 0, 0);
++    print_str("PASS: Case 6b (wake second waiter -> 1, both reaped)\n");
++
++    // 7. Real Waiter PRIVATE isolation test on shared mapping
++    volatile uint32_t *p_iso = (void *)sc(222, 0, 16384, 3, 0x21, -1, 0);
++    *p_iso = 0;
++    long c_iso = sc(220, 17, 0, 0, 0, 0, 0);
++    if (c_iso == 0) {
++        // Child waits with SHARED FUTEX_WAIT
++        struct ts t = {2, 0};
++        long wr = sc(98, (long)p_iso, FUTEX_WAIT, 0, (long)&t, 0, 0);
++        sc(93, wr == 0 ? 77 : 99, 0, 0, 0, 0, 0);
++    }
++
++    // Let child park
++    sc(101, (long)&park_d, 0, 0, 0, 0, 0);
++
++    // Parent calls FUTEX_WAKE_PRIVATE on shared mapping -> MUST return 0 (does NOT wake cross-process child)
++    long w_priv = sc(98, (long)p_iso, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
++    if (w_priv != 0) {
++        print_str("FAIL: FUTEX_WAKE_PRIVATE woke external waiter\n");
++        sc(93, 21, 0, 0, 0, 0, 0);
++    }
++    // Verify child is STILL BLOCKED
++    sc(101, (long)&settle_d, 0, 0, 0, 0, 0);
++    int iso_st = 0;
++    long iso_r = sc(260, c_iso, (long)&iso_st, WNOHANG, 0, 0, 0);
++    if (iso_r != 0) {
++        print_str("FAIL: child exited prematurely on PRIVATE wake\n");
++        sc(93, 22, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 7a (FUTEX_WAKE_PRIVATE returns 0, child still blocked)\n");
++
++    // Now parent calls shared FUTEX_WAKE -> child MUST wake and exit with 77
++    long w_shared = sc(98, (long)p_iso, FUTEX_WAKE, 1, 0, 0, 0);
++    if (w_shared != 1) {
++        print_str("FAIL: shared FUTEX_WAKE did not return 1\n");
++        sc(93, 23, 0, 0, 0, 0, 0);
++    }
++    sc(260, c_iso, (long)&iso_st, 0, 0, 0, 0);
++    if ((iso_st >> 8) != 77) {
++        print_str("FAIL: child did not exit with expected code 77\n");
++        sc(93, 24, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 7b (shared FUTEX_WAKE wakes child, reaped 77)\n");
++
++    // 8. Error mapping edge cases
++    // 8a: Misaligned address -> EINVAL (-22)
++    long err1 = sc(98, (long)p + 1, FUTEX_WAIT, 0, 0, 0, 0);
++    if (err1 != -22) {
++        print_str("FAIL: misaligned address did not return -EINVAL\n");
++        sc(93, 25, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 8a (misaligned -> -EINVAL)\n");
++
++    // 8b: Zero bitset -> EINVAL (-22)
++    long err2 = sc(98, (long)p, FUTEX_WAIT_BITSET, 0, 0, 0, 0); // bitset = 0
++    if (err2 != -22) {
++        print_str("FAIL: zero bitset did not return -EINVAL\n");
++        sc(93, 26, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 8b (zero bitset -> -EINVAL)\n");
++
++    // 8c: Unsupported non-any bitset on shared futex -> ENOSYS (-38)
++    long err3 = sc(98, (long)p, FUTEX_WAIT_BITSET, 0, 0, 0, 1); // bitset = 1
++    if (err3 != -38) {
++        print_str("FAIL: partial bitset on shared did not return -ENOSYS\n");
++        sc(93, 27, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 8c (partial bitset on shared -> -ENOSYS)\n");
++
++    // 8d: Unmapped invalid pointer -> EFAULT (-14)
++    long err4 = sc(98, 0x1234, FUTEX_WAIT, 0, 0, 0, 0);
++    if (err4 != -14) {
++        print_str("FAIL: unmapped pointer did not return -EFAULT\n");
++        sc(93, 28, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 8d (unmapped -> -EFAULT)\n");
++
++    // 8e: Wake error mappings
++    long err5 = sc(98, (long)p + 1, FUTEX_WAKE, 1, 0, 0, 0);
++    if (err5 != -22) {
++        print_str("FAIL: misaligned wake did not return -EINVAL\n");
++        sc(93, 29, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 8e (misaligned wake -> -EINVAL)\n");
++
++    // 8f: Wake on address with zero waiters returns 0 (Linux standard behavior)
++    long err6 = sc(98, 0x1234, FUTEX_WAKE, 1, 0, 0, 0);
++    if (err6 != 0) {
++        print_str("FAIL: unmapped wake with 0 waiters did not return 0\n");
++        sc(93, 30, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 8f (wake 0 waiters on unmapped addr -> 0)\n");
++
++    // 9. sys_futex_waitv on shared mapping -> ENOSYS (-38)
++    struct {
++        uint64_t val;
++        uint64_t uaddr;
++        uint32_t flags;
++        uint32_t __reserved;
++    } wv = { 0, (uint64_t)p, 2 /* FUTEX2_SIZE_U32, shared */, 0 };
++    long waitv_res = sc(449, (long)&wv, 1, 0, 0, 0, 0);
++    if (waitv_res != -38) {
++        print_str("FAIL: shared waitv did not return -ENOSYS\n");
++        sc(93, 31, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 9 (shared waitv -> -ENOSYS)\n");
++
++    // 10. sys_futex_waitv with FUTEX2_PRIVATE on stack/private memory -> non-ENOSYS (mismatch returns -EAGAIN)
++    uint32_t priv_word = 123;
++    struct {
++        uint64_t val;
++        uint64_t uaddr;
++        uint32_t flags;
++        uint32_t __reserved;
++    } wv_priv = { 999 /* mismatch */, (uint64_t)&priv_word, 2 | 0x80 /* FUTEX2_SIZE_U32 | FUTEX2_PRIVATE */, 0 };
++    long waitv_priv_res = sc(449, (long)&wv_priv, 1, 0, 0, 0, 0);
++    if (waitv_priv_res != -11) {
++        print_str("FAIL: private waitv mismatch did not return -EAGAIN\n");
++        sc(93, 32, 0, 0, 0, 0, 0);
++    }
++    print_str("PASS: Case 10 (private waitv supported, mismatch -> -EAGAIN)\n");
++
++    print_str("ALL FUTEX ABI SUITE TESTS PASSED!\n");
++    sc(93, 0, 0, 0, 0, 0, 0);
++}

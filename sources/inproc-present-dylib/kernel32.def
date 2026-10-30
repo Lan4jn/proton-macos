@@ -1,0 +1,15 @@
+LIBRARY kernel32.dll
+EXPORTS
+GetStdHandle
+WriteFile
+ReadFile
+CreateFileA
+CloseHandle
+LoadLibraryA
+GetProcAddress
+GetLastError
+ExitProcess
+GetCommandLineA
+QueryPerformanceCounter
+QueryPerformanceFrequency
+GetTickCount64

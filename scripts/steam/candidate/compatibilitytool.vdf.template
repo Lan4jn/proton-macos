@@ -1,0 +1,13 @@
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "proton_macos_probe"
+    {
+      "install_path" "."
+      "display_name" "macOS Proton Probe (Offline Research Tool)"
+      "from_oslist"  "windows"
+      "to_oslist"    "macos"
+    }
+  }
+}

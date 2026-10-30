@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake elfuse binary that behaves improperly to verify runner failure detection
+echo "FAKE_ELFUSE: simulated failure"
+exit 99

@@ -1,0 +1,88 @@
+{
+  "schema_version": "wine_patch_release_evidence_v2",
+  "task_id": "task-131",
+  "release_package": "sources/patch-release",
+  "commit_provenance": {
+    "target_repository": "https://github.com/ValveSoftware/wine",
+    "target_commit": "adea6cbac9d00bb22910145354d00c463fcf3afc",
+    "target_commit_timestamp_utc": "2026-09-24T00:51:45Z",
+    "provenance_qualification": "Empirically verified structural and runtime compatible baseline within [66ee546cbea4..adea6cbac]; not formally certified via Valve submodule pointer as the unique exact build commit",
+    "equivalent_commit_range": "66ee546cbea4f15d9098bc146312a818c356f9e5..adea6cbac9d00bb22910145354d00c463fcf3afc",
+    "shipped_proton_build": {
+      "version_string": "1790245028 experimental-11.0-20260924-arm64",
+      "build_epoch": 1790245028,
+      "build_timestamp_utc": "2026-09-24T10:17:08Z"
+    }
+  },
+  "binary_fingerprints": {
+    "release_patch_file": "wine-vulkan-reentrancy-guard-adea6cbac.patch",
+    "release_patch_sha256": "a22655b6f7b77edabbf0796fe6ad9d613a01cb2282dd27b1d09c29cadc7443a2",
+    "shipped_original_win32u_so": "4f6013fa6f8a9a4356d6342b1f49f245354f18dfb896b662cdc502df8f803fb5",
+    "adea_pristine_built_win32u_so": "96de5f0af594cf765fe7d350c0520b1e5568970633de9af63fad494012e5b10b",
+    "adea_patched_built_win32u_so": "59a76b05d943bdb3e92538eb641b979e6d432897afcfd4e801c3b177040478ed",
+    "shipped_winevulkan_so": "2786ca6f5f440821972e91a371e609d2d482597a8b6d75bcf02e287f83eea9ab",
+    "probe_arm64_exe": "f82f4e7987ae1dc4ef20674c2f24809b4e7c88bbd4b902fb754a8dc0a8ec6b62",
+    "elfuse_runtime": "8180332221745ee0a1870d1bf588ce97cb72fa1dc9a7e8f0c89af918ff0abcda"
+  },
+  "patch_byte_identity_verification": {
+    "verification_method": "Clean application of normalized release patch vs original experimental patch onto pristine adea6cbac source tree",
+    "byte_identical_confirmed": true,
+    "applied_file_checksums": {
+      "dlls/win32u/d3dkmt.c": "2281833cd4b95353651044b059fece64a6716fc521befca32ed0e53c576917df",
+      "dlls/win32u/vulkan.c": "8bdc516db04b6a542f8a7975148622812df9167c2ee522c0c4522360dd3e336e",
+      "dlls/win32u/win32u_private.h": "7f504dd51cb94bc5e1a4eea31e431df765fd9644e797ac464c16f3cb007ec368"
+    },
+    "diff_against_tested_patched_tree": "EMPTY (0 byte difference, 100% byte-for-byte semantic identity)"
+  },
+  "abi_structural_alignment": {
+    "vulkan_spec_version": "1.4.357",
+    "instance_function_count": 82,
+    "sizeof_vulkan_instance": 760,
+    "sizeof_vulkan_instance_hex": "0x2f8",
+    "offsetof_physical_devices": 736,
+    "offsetof_physical_devices_hex": "0x2e0",
+    "offsetof_physical_device_count": 744,
+    "offsetof_physical_device_count_hex": "0x2e8",
+    "sizeof_vulkan_physical_device": 648,
+    "sizeof_vulkan_physical_device_hex": "0x288",
+    "sizeof_instance": 872,
+    "sizeof_instance_hex": "0x368",
+    "natural_alignment_confirmed": true,
+    "struct_changes_in_patch": 0
+  },
+  "three_way_binary_differentiation": {
+    "shipped_original_win32u": {
+      "sha256": "4f6013fa6f8a9a4356d6342b1f49f245354f18dfb896b662cdc502df8f803fb5",
+      "role": "Valve shipped original binary",
+      "test_run": "logs/wine-pin/shipped_baseline/run-73d055tk",
+      "outcome": "DEADLOCK_REPRODUCED (exit 124, timeout, futex wait on 0x201039970)"
+    },
+    "adea_pristine_built_win32u": {
+      "sha256": "96de5f0af594cf765fe7d350c0520b1e5568970633de9af63fad494012e5b10b",
+      "role": "Source build from pristine adea6cbac without patch",
+      "purpose": "Static disassembly verification of natural struct offsets (0x2f8, 0x2e0, etc.)"
+    },
+    "adea_patched_built_win32u": {
+      "sha256": "59a76b05d943bdb3e92538eb641b979e6d432897afcfd4e801c3b177040478ed",
+      "role": "Source build from adea6cbac with reentrancy guard patch",
+      "test_run": "logs/wine-pin/patched_adea/run-sjo653xi",
+      "outcome": "WIN_ARM64_VULKAN_OK (exit 0, duration 48.18s, Step 5 reached, count=1, llvmpipe)"
+    }
+  },
+  "runtime_environment_caveats": {
+    "session_shared_diagnostic_active": true,
+    "elfuse_diag_session_shared_status": "Enabled (ELFUSE_DIAG_SESSION_SHARED=1) during test runs; uses diagnostic shared alias mappings for winstation sections, diverging from true Linux page cache copy-on-write semantics",
+    "concurrency_scope": "Guard eliminates in-process once recursion; cross-process COW semantics remain an orthogonal host concern",
+    "tls_allocation_qualification": "Compiler thread-local storage static __thread int in .tbss eliminates POSIX key table exhaustion, but in dynamically loaded DSOs (dlopen), access via __tls_get_addr may still trigger dynamic thread vector (DTV) allocations; .tbss does not imply absolute zero dynamic allocation under all dynamic linking edge cases"
+  },
+  "apply_check_self_test": {
+    "patch_p1_dry_run_exit": 0,
+    "git_apply_check_exit": 0,
+    "modified_files": [
+      "dlls/win32u/d3dkmt.c",
+      "dlls/win32u/vulkan.c",
+      "dlls/win32u/win32u_private.h"
+    ],
+    "verification_log": "sources/patch-release/apply-check.log"
+  }
+}

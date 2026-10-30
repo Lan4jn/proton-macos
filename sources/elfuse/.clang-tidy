@@ -1,0 +1,74 @@
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -bugprone-branch-clone,
+  -bugprone-signal-handler,
+  -bugprone-misplaced-widening-cast,
+  cert-*,
+  -cert-err33-c,
+  -cert-err34-c,
+  -cert-dcl37-c,
+  -cert-dcl51-cpp,
+  -cert-sig30-c,
+  -cert-msc54-cpp,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -clang-analyzer-unix.BlockInCriticalSection,
+  -clang-analyzer-optin.performance.Padding,
+  -clang-analyzer-optin.taint.TaintedAlloc,
+  -clang-analyzer-unix.StdCLibraryFunctions,
+  -clang-analyzer-optin.portability.UnixAPI,
+  -clang-analyzer-security.ArrayBound,
+  misc-redundant-expression,
+  performance-*,
+  -performance-no-int-to-ptr,
+  readability-function-size,
+  readability-inconsistent-declaration-parameter-name
+
+WarningsAsErrors: 'readability-function-size'
+HeaderFilterRegex: 'src/.*\.h$'
+CheckOptions:
+  - key: bugprone-unsafe-functions.ReportMoreUnsafeFunctions
+    value: false
+  # A ceiling, not a target. Nothing else in the tree measures how big a
+  # function has grown, so a syscall body could and did reach four figures
+  # without any gate noticing.
+  #
+  # With the eleven NOLINT suppressions in place the check reports nothing on
+  # this tree today, and all eleven are load-bearing: clang-tidy accounts for
+  # exactly eleven NOLINT suppressions on a full run. That is not the same as
+  # 400 being a comfortable margin. A dozen further functions sit between 250
+  # and the ceiling by this check's own counting, which includes comments and
+  # blank lines, so the next function to cross 400 is more likely to be one of
+  # those than anything newly written. Expect this to land on existing code
+  # first, and count rather than trust that figure: the awk scan in
+  # elfuse-refactor reports it.
+  #
+  # The one check here that gates: WarningsAsErrors names it, so a function
+  # crossing 400 lines fails make lint and the tidy CI job that runs it.
+  # Every other check stays advisory. Gating costs nothing today precisely
+  # because the eleven suppressions above are in place, which is what makes
+  # this the moment to turn it on: the ceiling now binds new growth, and the
+  # exempt bodies stay exempt in writing rather than by the check reporting
+  # into a log nobody fails on.
+  #
+  # A body that legitimately has to cross it takes a NOLINTNEXTLINE and says
+  # why in the commit. That is a decision someone makes, which is the whole
+  # difference from a warning that scrolls past.
+  #
+  # The other size axes stay off (-1) because the line count is the one that
+  # correlates with a body no reader can hold at once.
+  - key: readability-function-size.LineThreshold
+    value: 400
+  - key: readability-function-size.StatementThreshold
+    value: -1
+  - key: readability-function-size.BranchThreshold
+    value: -1
+  - key: readability-function-size.ParameterThreshold
+    value: -1
+  - key: readability-function-size.NestingThreshold
+    value: -1
+  - key: readability-function-size.VariableThreshold
+    value: -1
